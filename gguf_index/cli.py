@@ -240,24 +240,82 @@ def identify(file_paths: tuple[str, ...], json_path: str | None, sqlite_path: st
         sys.exit(1)
 
 
-@cli.command()
+@cli.command(name="export")
 @click.option("--output", "-o", type=click.Path(), help="Output file path (default: stdout)")
+@click.option("--format", "-f", "fmt", type=click.Choice(["json", "jsonl"]), default="jsonl", help="Output format (default: jsonl)")
 @click.option("--json-path", type=click.Path(), help="Path to JSON index file")
 @click.option("--sqlite-path", type=click.Path(), help="Path to SQLite database file")
 @click.option("--json/--no-json", "use_json", default=True, help="Use JSON storage")
 @click.option("--sqlite/--no-sqlite", "use_sqlite", default=True, help="Use SQLite storage")
-def export(output: str | None, json_path: str | None, sqlite_path: str | None, use_json: bool, use_sqlite: bool):
-    """Export the index to JSON format."""
+def export_cmd(output: str | None, fmt: str, json_path: str | None, sqlite_path: str | None, use_json: bool, use_sqlite: bool):
+    """Export the index for sharing.
+
+    Default format is JSONL (one entry per line), which is efficient for sharing and importing.
+    """
     index = get_index(json_path, sqlite_path, use_json, use_sqlite)
 
-    data = index.export_json()
+    entries = index.get_all()
 
-    if output:
-        with open(output, "w") as f:
-            json.dump(data, f, indent=2)
-        console.print(f"[green]Exported {len(data)} entries to {output}[/green]")
-    else:
-        click.echo(json.dumps(data, indent=2))
+    if fmt == "jsonl":
+        lines = [json.dumps(entry.to_dict(), separators=(",", ":")) for entry in entries]
+        content = "\n".join(lines)
+        if output:
+            with open(output, "w") as f:
+                f.write(content)
+                f.write("\n")
+            console.print(f"[green]Exported {len(entries)} entries to {output} (JSONL)[/green]")
+        else:
+            click.echo(content)
+    else:  # json
+        data = {f"{e.repo_id}/{e.revision}/{e.filename}": e.to_dict() for e in entries}
+        if output:
+            with open(output, "w") as f:
+                json.dump(data, f, indent=2)
+            console.print(f"[green]Exported {len(data)} entries to {output} (JSON)[/green]")
+        else:
+            click.echo(json.dumps(data, indent=2))
+
+
+@cli.command(name="import")
+@click.argument("input_file", type=click.Path(exists=True))
+@click.option("--json-path", type=click.Path(), help="Path to JSON index file")
+@click.option("--sqlite-path", type=click.Path(), help="Path to SQLite database file")
+@click.option("--json/--no-json", "use_json", default=True, help="Use JSON storage")
+@click.option("--sqlite/--no-sqlite", "use_sqlite", default=True, help="Use SQLite storage")
+def import_cmd(input_file: str, json_path: str | None, sqlite_path: str | None, use_json: bool, use_sqlite: bool):
+    """Import entries from a JSONL file into the local index.
+
+    INPUT_FILE is a JSONL file (one JSON entry per line).
+    """
+    from .storage import GGUFEntry
+
+    index = get_index(json_path, sqlite_path, use_json, use_sqlite)
+
+    imported = 0
+    errors = 0
+
+    with open(input_file, "r") as f:
+        with console.status("Importing entries...") as status:
+            for line_num, line in enumerate(f, 1):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    data = json.loads(line)
+                    entry = GGUFEntry.from_dict(data)
+                    index.add(entry)
+                    imported += 1
+                    if imported % 10000 == 0:
+                        status.update(f"Imported {imported} entries...")
+                except Exception as e:
+                    errors += 1
+                    if errors <= 5:
+                        console.print(f"[yellow]Line {line_num}: {e}[/yellow]")
+
+    index.save()
+    console.print(f"[green]Imported {imported} entries[/green]")
+    if errors:
+        console.print(f"[yellow]Skipped {errors} invalid entries[/yellow]")
 
 
 @cli.command()
