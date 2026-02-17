@@ -7,7 +7,7 @@ name = "gguf-index"
 version = "0.1.0"
 description = "Index and identify GGUF files by their SHA256 hash"
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 license = {text = "MIT"}
 authors = [
     {name = "GGUF Index Contributors"}
