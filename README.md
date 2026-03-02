@@ -4,9 +4,21 @@ A Python tool (CLI + library) that creates an index mapping SHA256 hashes of GGU
 
 ## Installation
 
+Using [uv](https://docs.astral.sh/uv/) (recommended):
+
 ```bash
-pip install -e .
+uv sync
+source .venv/bin/activate
+gguf-index --help
 ```
+
+or directly:
+
+```bash
+uv tool install gguf-index@git+https://github.com/mozilla-ai/gguf-index
+gguf-index --help
+```
+
 
 ## CLI Usage
 
