@@ -138,4 +138,4 @@ By default, both backends are used. You can customize the storage paths or disab
 
 ## License
 
-MIT
+Apache-2.0
