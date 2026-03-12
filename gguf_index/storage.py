@@ -3,7 +3,7 @@
 import json
 import sqlite3
 from abc import ABC, abstractmethod
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -25,7 +25,7 @@ class GGUFEntry:
         self.revision = revision  # commit hash
         self.filename = filename
         self.size = size
-        self.indexed_at = indexed_at or datetime.utcnow().isoformat() + "Z"
+        self.indexed_at = indexed_at or datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
     @property
     def url(self) -> str:
@@ -176,11 +176,12 @@ class JSONStorage(StorageBackend):
 class SQLiteStorage(StorageBackend):
     """SQLite storage backend for fast lookups.
 
-    Schema v4: (repo_id, revision, filename) as primary key.
+    Schema v5: (repo_id, revision, filename) as primary key.
     Each unique (repo_id, revision, filename) maps to exactly one SHA256.
+    Added repos table for caching indexed repositories.
     """
 
-    SCHEMA_VERSION = 4
+    SCHEMA_VERSION = 5
 
     def __init__(self, path: str | Path):
         self.path = Path(path)
@@ -206,6 +207,7 @@ class SQLiteStorage(StorageBackend):
                 return  # Already at current version
             # Old version - drop and recreate
             conn.execute("DROP TABLE IF EXISTS gguf_files")
+            conn.execute("DROP TABLE IF EXISTS repos")
             conn.execute("DROP TABLE IF EXISTS schema_version")
 
         # Create fresh schema
@@ -229,6 +231,16 @@ class SQLiteStorage(StorageBackend):
         """)
         conn.execute("CREATE INDEX idx_sha256 ON gguf_files(sha256)")
         conn.execute("CREATE INDEX idx_repo_id ON gguf_files(repo_id)")
+
+        # Repo cache table for tracking indexed repositories
+        conn.execute("""
+            CREATE TABLE repos (
+                repo_id TEXT PRIMARY KEY,
+                last_indexed_commit TEXT NOT NULL,
+                last_indexed_at TEXT NOT NULL,
+                max_revisions_indexed INTEGER
+            )
+        """)
         conn.commit()
 
     def add(self, entry: GGUFEntry) -> None:
@@ -293,3 +305,51 @@ class SQLiteStorage(StorageBackend):
         if self._conn:
             self._conn.close()
             self._conn = None
+
+    def get_repo_cache(self, repo_id: str) -> dict[str, Any] | None:
+        """Get cached repo info.
+
+        Returns:
+            Dict with last_indexed_commit, last_indexed_at, max_revisions_indexed
+            or None if not cached.
+        """
+        row = self._get_conn().execute(
+            "SELECT last_indexed_commit, last_indexed_at, max_revisions_indexed FROM repos WHERE repo_id = ?",
+            (repo_id,),
+        ).fetchone()
+        if row:
+            return {
+                "last_indexed_commit": row["last_indexed_commit"],
+                "last_indexed_at": row["last_indexed_at"],
+                "max_revisions_indexed": row["max_revisions_indexed"],
+            }
+        return None
+
+    def set_repo_cache(self, repo_id: str, commit: str, max_revisions: int | None) -> None:
+        """Update cache after indexing a repository."""
+        conn = self._get_conn()
+        indexed_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO repos (repo_id, last_indexed_commit, last_indexed_at, max_revisions_indexed)
+            VALUES (?, ?, ?, ?)
+            """,
+            (repo_id, commit, indexed_at, max_revisions),
+        )
+        conn.commit()
+
+    def clear_repo_cache(self, repo_id: str | None = None) -> None:
+        """Clear cache (all or specific repo)."""
+        conn = self._get_conn()
+        if repo_id:
+            conn.execute("DELETE FROM repos WHERE repo_id = ?", (repo_id,))
+        else:
+            conn.execute("DELETE FROM repos")
+        conn.commit()
+
+    def clear_all(self) -> None:
+        """Clear all data including cache."""
+        conn = self._get_conn()
+        conn.execute("DELETE FROM gguf_files")
+        conn.execute("DELETE FROM repos")
+        conn.commit()

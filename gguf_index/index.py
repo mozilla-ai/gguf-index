@@ -2,7 +2,7 @@
 
 import hashlib
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 
 from .api import HuggingFaceAPI
 from .storage import GGUFEntry, JSONStorage, SQLiteStorage, StorageBackend
@@ -114,12 +114,71 @@ class GGUFIndex:
             return self.backends[0].get_all()
         return []
 
+    def _get_repo_cache(self, repo_id: str) -> dict[str, Any] | None:
+        """Get cached repo info from SQLite backend."""
+        if self.sqlite_storage:
+            return self.sqlite_storage.get_repo_cache(repo_id)
+        return None
+
+    def _set_repo_cache(self, repo_id: str, commit: str, max_revisions: int | None) -> None:
+        """Update repo cache in SQLite backend."""
+        if self.sqlite_storage:
+            self.sqlite_storage.set_repo_cache(repo_id, commit, max_revisions)
+
+    def _revisions_sufficient(self, cached_revisions: int | None, requested_revisions: int | None) -> bool:
+        """Check if cached revisions cover the requested amount.
+
+        Args:
+            cached_revisions: Number of revisions previously indexed (None = all)
+            requested_revisions: Number of revisions now requested (None = all)
+
+        Returns:
+            True if we don't need to re-index for more revisions
+        """
+        # If we cached all revisions, that covers any request
+        if cached_revisions is None:
+            return True
+        # If requesting all revisions but we only cached some, need to re-index
+        if requested_revisions is None:
+            return False
+        # Otherwise, cached >= requested means we're covered
+        return cached_revisions >= requested_revisions
+
+    def _should_skip_repo(
+        self,
+        repo_id: str,
+        current_commit: str,
+        max_revisions: int | None,
+    ) -> bool:
+        """Check if we should skip indexing a repo based on cache.
+
+        Args:
+            repo_id: Repository ID
+            current_commit: Current HEAD commit of the repo
+            max_revisions: Requested max revisions to index
+
+        Returns:
+            True if the repo should be skipped (already indexed)
+        """
+        cached = self._get_repo_cache(repo_id)
+        if not cached:
+            return False
+
+        # Skip if commit unchanged AND we have enough revisions cached
+        if (cached["last_indexed_commit"] == current_commit and
+            self._revisions_sufficient(cached["max_revisions_indexed"], max_revisions)):
+            return True
+
+        return False
+
     def build_from_search(
         self,
         query: str | None = None,
         limit: int | None = None,
         max_revisions: int | None = None,
         progress_callback: Callable[[str, int, int], None] | None = None,
+        force: bool = False,
+        skip_callback: Callable[[str, str], None] | None = None,
     ) -> int:
         """
         Build the index by searching HuggingFace for GGUF repositories.
@@ -129,6 +188,8 @@ class GGUFIndex:
             limit: Maximum number of repositories to process
             max_revisions: Maximum revisions per file (None = all)
             progress_callback: Optional callback(repo_id, current, total) for progress
+            force: Force re-indexing even if cached
+            skip_callback: Optional callback(repo_id, commit) when skipping a cached repo
 
         Returns:
             Number of files indexed
@@ -144,6 +205,18 @@ class GGUFIndex:
                 progress_callback(repo_id, i + 1, total_repos)
 
             try:
+                # Get current HEAD commit
+                repo_info = self.api.api.repo_info(repo_id, files_metadata=False)
+                current_commit = repo_info.sha
+
+                # Check cache
+                if not force and self._should_skip_repo(repo_id, current_commit, max_revisions):
+                    if skip_callback:
+                        skip_callback(repo_id, current_commit)
+                    continue
+
+                # Index the repo
+                repo_files = 0
                 for file_info in self.api.get_repo_gguf_files(repo_id, max_revisions=max_revisions):
                     entry = GGUFEntry(
                         sha256=file_info["sha256"],
@@ -153,7 +226,11 @@ class GGUFIndex:
                         size=file_info["size"],
                     )
                     self.add(entry)
+                    repo_files += 1
                     files_indexed += 1
+
+                # Update cache after successful indexing (even if no files found)
+                self._set_repo_cache(repo_id, current_commit, max_revisions)
             except Exception:
                 # Skip repos that fail (access issues, etc.)
                 continue
@@ -162,17 +239,32 @@ class GGUFIndex:
             self.save()
         return files_indexed
 
-    def index_repo(self, repo_id: str, max_revisions: int | None = None) -> int:
+    def index_repo(
+        self,
+        repo_id: str,
+        max_revisions: int | None = None,
+        force: bool = False,
+    ) -> tuple[int, str | None]:
         """
         Index all GGUF files from a specific repository.
 
         Args:
             repo_id: HuggingFace repository ID
             max_revisions: Maximum number of revisions per file (None = all)
+            force: Force re-indexing even if cached
 
         Returns:
-            Number of files indexed
+            Tuple of (files_indexed, skipped_commit) where skipped_commit is the
+            commit hash if the repo was skipped due to cache, or None if indexed.
         """
+        # Get current HEAD commit
+        repo_info = self.api.api.repo_info(repo_id, files_metadata=False)
+        current_commit = repo_info.sha
+
+        # Check cache
+        if not force and self._should_skip_repo(repo_id, current_commit, max_revisions):
+            return 0, current_commit
+
         files_indexed = 0
 
         for file_info in self.api.get_repo_gguf_files(repo_id, max_revisions=max_revisions):
@@ -186,8 +278,11 @@ class GGUFIndex:
             self.add(entry)
             files_indexed += 1
 
+        # Update cache after successful indexing (even if no files found)
+        self._set_repo_cache(repo_id, current_commit, max_revisions)
+
         self.save()
-        return files_indexed
+        return files_indexed, None
 
     @staticmethod
     def compute_sha256(file_path: str | Path, chunk_size: int = 8192) -> str:
