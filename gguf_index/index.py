@@ -46,20 +46,21 @@ class GGUFIndex:
 
         # Use default paths if none provided and use_defaults is True
         if not json_path and not sqlite_path and use_defaults:
-            json_path = DEFAULT_JSON_PATH
             sqlite_path = DEFAULT_SQLITE_PATH
 
-        if json_path:
-            self.json_storage = JSONStorage(json_path)
-            self.backends.append(self.json_storage)
-        else:
-            self.json_storage = None
-
+        # SQLite is primary backend (added first for stats/queries)
         if sqlite_path:
             self.sqlite_storage = SQLiteStorage(sqlite_path)
             self.backends.append(self.sqlite_storage)
         else:
             self.sqlite_storage = None
+
+        # JSON is secondary/opt-in backend
+        if json_path:
+            self.json_storage = JSONStorage(json_path)
+            self.backends.append(self.json_storage)
+        else:
+            self.json_storage = None
 
         if not self.backends:
             # Fallback to SQLite in current directory

@@ -33,12 +33,13 @@ def get_index(
     verbose: bool = False,
 ) -> GGUFIndex:
     """Create a GGUFIndex with the specified storage backends."""
+    # JSON is opt-in (only if --json flag or --json-path provided)
     json_p = Path(json_path) if json_path else (DEFAULT_JSON_PATH if use_json else None)
+    # SQLite is the default
     sqlite_p = Path(sqlite_path) if sqlite_path else (DEFAULT_SQLITE_PATH if use_sqlite else None)
 
-    # Default to both if neither specified
+    # Default to SQLite-only if neither specified
     if not json_p and not sqlite_p:
-        json_p = DEFAULT_JSON_PATH
         sqlite_p = DEFAULT_SQLITE_PATH
 
     # Get token from argument or environment
@@ -67,7 +68,7 @@ def cli():
 @click.option("--token", "-t", type=str, default=None, help="HuggingFace API token (or set HF_TOKEN env var)")
 @click.option("--json-path", type=click.Path(), help="Path to JSON index file")
 @click.option("--sqlite-path", type=click.Path(), help="Path to SQLite database file")
-@click.option("--json/--no-json", "use_json", default=True, help="Use JSON storage")
+@click.option("--json/--no-json", "use_json", default=False, help="Also use JSON storage (opt-in)")
 @click.option("--sqlite/--no-sqlite", "use_sqlite", default=True, help="Use SQLite storage")
 def search(query: str | None, limit: int | None, revisions: int, rate: float | None, workers: int, force: bool, verbose: bool, token: str | None, json_path: str | None, sqlite_path: str | None, use_json: bool, use_sqlite: bool):
     """Search HuggingFace for GGUF files and add them to the index.
@@ -122,7 +123,7 @@ def search(query: str | None, limit: int | None, revisions: int, rate: float | N
 @click.option("--token", "-t", type=str, default=None, help="HuggingFace API token (or set HF_TOKEN env var)")
 @click.option("--json-path", type=click.Path(), help="Path to JSON index file")
 @click.option("--sqlite-path", type=click.Path(), help="Path to SQLite database file")
-@click.option("--json/--no-json", "use_json", default=True, help="Use JSON storage")
+@click.option("--json/--no-json", "use_json", default=False, help="Also use JSON storage (opt-in)")
 @click.option("--sqlite/--no-sqlite", "use_sqlite", default=True, help="Use SQLite storage")
 def add(repo_id: str, revisions: int, rate: float | None, workers: int, force: bool, verbose: bool, token: str | None, json_path: str | None, sqlite_path: str | None, use_json: bool, use_sqlite: bool):
     """Index all GGUF files from a specific repository.
@@ -151,7 +152,7 @@ def add(repo_id: str, revisions: int, rate: float | None, workers: int, force: b
 @click.argument("hashes", nargs=-1, required=True)
 @click.option("--json-path", type=click.Path(), help="Path to JSON index file")
 @click.option("--sqlite-path", type=click.Path(), help="Path to SQLite database file")
-@click.option("--json/--no-json", "use_json", default=True, help="Use JSON storage")
+@click.option("--json/--no-json", "use_json", default=False, help="Also use JSON storage (opt-in)")
 @click.option("--sqlite/--no-sqlite", "use_sqlite", default=True, help="Use SQLite storage")
 def lookup(hashes: tuple[str, ...], json_path: str | None, sqlite_path: str | None, use_json: bool, use_sqlite: bool):
     """Look up GGUF file(s) by SHA256 hash.
@@ -199,7 +200,7 @@ def lookup(hashes: tuple[str, ...], json_path: str | None, sqlite_path: str | No
 @click.argument("file_paths", nargs=-1, required=True, type=click.Path(exists=True))
 @click.option("--json-path", type=click.Path(), help="Path to JSON index file")
 @click.option("--sqlite-path", type=click.Path(), help="Path to SQLite database file")
-@click.option("--json/--no-json", "use_json", default=True, help="Use JSON storage")
+@click.option("--json/--no-json", "use_json", default=False, help="Also use JSON storage (opt-in)")
 @click.option("--sqlite/--no-sqlite", "use_sqlite", default=True, help="Use SQLite storage")
 def identify(file_paths: tuple[str, ...], json_path: str | None, sqlite_path: str | None, use_json: bool, use_sqlite: bool):
     """Identify local GGUF file(s) by computing SHA256 and looking up.
@@ -265,7 +266,7 @@ def identify(file_paths: tuple[str, ...], json_path: str | None, sqlite_path: st
 @click.option("--token", "-t", type=str, default=None, help="HuggingFace API token for push (or set HF_TOKEN env var)")
 @click.option("--json-path", type=click.Path(), help="Path to JSON index file")
 @click.option("--sqlite-path", type=click.Path(), help="Path to SQLite database file")
-@click.option("--json/--no-json", "use_json", default=True, help="Use JSON storage")
+@click.option("--json/--no-json", "use_json", default=False, help="Also use JSON storage (opt-in)")
 @click.option("--sqlite/--no-sqlite", "use_sqlite", default=True, help="Use SQLite storage")
 def export_cmd(output: str | None, fmt: str, push: bool, repo: str, token: str | None, json_path: str | None, sqlite_path: str | None, use_json: bool, use_sqlite: bool):
     """Export the index for sharing.
@@ -330,7 +331,7 @@ def export_cmd(output: str | None, fmt: str, push: bool, repo: str, token: str |
 @click.option("--token", "-t", type=str, default=None, help="HuggingFace API token (or set HF_TOKEN env var)")
 @click.option("--json-path", type=click.Path(), help="Path to JSON index file")
 @click.option("--sqlite-path", type=click.Path(), help="Path to SQLite database file")
-@click.option("--json/--no-json", "use_json", default=True, help="Use JSON storage")
+@click.option("--json/--no-json", "use_json", default=False, help="Also use JSON storage (opt-in)")
 @click.option("--sqlite/--no-sqlite", "use_sqlite", default=True, help="Use SQLite storage")
 def import_cmd(source: str | None, repo: str, fmt: str | None, merge: bool, token: str | None, json_path: str | None, sqlite_path: str | None, use_json: bool, use_sqlite: bool):
     """Import index from parquet file or HuggingFace dataset.
@@ -413,7 +414,7 @@ def import_cmd(source: str | None, repo: str, fmt: str | None, merge: bool, toke
 @cli.command()
 @click.option("--json-path", type=click.Path(), help="Path to JSON index file")
 @click.option("--sqlite-path", type=click.Path(), help="Path to SQLite database file")
-@click.option("--json/--no-json", "use_json", default=True, help="Use JSON storage")
+@click.option("--json/--no-json", "use_json", default=False, help="Also use JSON storage (opt-in)")
 @click.option("--sqlite/--no-sqlite", "use_sqlite", default=True, help="Use SQLite storage")
 def stats(json_path: str | None, sqlite_path: str | None, use_json: bool, use_sqlite: bool):
     """Show index statistics."""
