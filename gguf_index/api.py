@@ -41,6 +41,8 @@ class HuggingFaceAPI:
         self._last_request_time = 0.0
         self._verbose = verbose
         self._log: Callable[[str], None] = _default_log if verbose else lambda x: None
+        self._request_count = 0
+        self._request_count_lock = Lock()
         if verbose:
             if self.requests_per_second == 0:
                 self._log(f"Rate limit: disabled (no throttling), workers: {self.max_workers}")
@@ -109,6 +111,8 @@ class HuggingFaceAPI:
                     continue
 
                 resp.raise_for_status()
+                with self._request_count_lock:
+                    self._request_count += 1
                 return resp
 
             except httpx.HTTPStatusError as e:
@@ -184,6 +188,8 @@ class HuggingFaceAPI:
         # First, get the list of GGUF files in the repo (at HEAD)
         try:
             info = self.api.repo_info(repo_id, files_metadata=True)
+            with self._request_count_lock:
+                self._request_count += 1
         except Exception as e:
             raise RuntimeError(f"Failed to get repo info for {repo_id}: {e}") from e
 
@@ -328,6 +334,8 @@ class HuggingFaceAPI:
     def get_repo_info(self, repo_id: str) -> dict[str, Any]:
         """Get repository metadata."""
         model_info = self.api.model_info(repo_id)
+        with self._request_count_lock:
+            self._request_count += 1
         return {
             "repo_id": model_info.id,
             "author": model_info.author,
@@ -336,8 +344,26 @@ class HuggingFaceAPI:
             "tags": model_info.tags,
         }
 
+    def repo_info(self, repo_id: str, files_metadata: bool = False) -> Any:
+        """Get repository info (wrapper around HfApi.repo_info with request counting)."""
+        result = self.api.repo_info(repo_id, files_metadata=files_metadata)
+        with self._request_count_lock:
+            self._request_count += 1
+        return result
+
     def close(self) -> None:
         """Close the HTTP client."""
         if self._http_client:
             self._http_client.close()
             self._http_client = None
+
+    @property
+    def request_count(self) -> int:
+        """Get the number of HTTP requests made."""
+        with self._request_count_lock:
+            return self._request_count
+
+    def reset_request_count(self) -> None:
+        """Reset the request counter to zero."""
+        with self._request_count_lock:
+            self._request_count = 0

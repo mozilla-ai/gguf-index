@@ -207,7 +207,7 @@ class GGUFIndex:
 
             try:
                 # Get current HEAD commit
-                repo_info = self.api.api.repo_info(repo_id, files_metadata=False)
+                repo_info = self.api.repo_info(repo_id, files_metadata=False)
                 current_commit = repo_info.sha
 
                 # Check cache
@@ -259,7 +259,7 @@ class GGUFIndex:
             commit hash if the repo was skipped due to cache, or None if indexed.
         """
         # Get current HEAD commit
-        repo_info = self.api.api.repo_info(repo_id, files_metadata=False)
+        repo_info = self.api.repo_info(repo_id, files_metadata=False)
         current_commit = repo_info.sha
 
         # Check cache

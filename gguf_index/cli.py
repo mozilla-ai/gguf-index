@@ -100,24 +100,34 @@ def search(query: str | None, limit: int | None, revisions: int, rate: float | N
     # Convert 0 to None (no limit)
     max_revisions = revisions if revisions != 0 else None
     skipped_count = 0
+    checked_count = 0
 
     with Progress(
         SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
         BarColumn(),
         TaskProgressColumn(),
+        TextColumn("{task.fields[status]}"),
+        TextColumn("[progress.description]{task.description}"),
         console=console,
     ) as progress:
-        task = progress.add_task("Searching repositories...", total=None)
+        task = progress.add_task("Searching repositories...", total=None, status="")
 
         def update_progress(repo_id: str, current: int, total: int):
-            progress.update(task, description=f"Indexing {repo_id}", completed=current, total=total)
+            nonlocal checked_count
+            checked_count = current
+            # Use (current - 1) because we haven't finished checking this repo yet
+            indexed = (current - 1) - skipped_count
+            status = f"[green]indexed: {indexed}[/green] [yellow]cached: {skipped_count}[/yellow]"
+            progress.update(task, description=f"Checking {repo_id}", completed=current, total=total, status=status)
 
         def on_skip(repo_id: str, commit: str):
             nonlocal skipped_count
             skipped_count += 1
+            indexed = checked_count - skipped_count
+            status = f"[green]indexed: {indexed}[/green] [yellow]cached: {skipped_count}[/yellow]"
+            progress.update(task, description=f"[dim]Cached: {repo_id}[/dim]", status=status)
             if verbose:
-                console.print(f"[dim]Skipping {repo_id} (cached at {commit[:8]})[/dim]")
+                console.print(f"[dim]Skipping {repo_id} (at {commit[:8]})[/dim]")
 
         files_indexed = index.build_from_search(
             query=query,
@@ -128,9 +138,11 @@ def search(query: str | None, limit: int | None, revisions: int, rate: float | N
             skip_callback=on_skip,
         )
 
-    console.print(f"\n[green]Indexed {files_indexed} GGUF files[/green]")
+    indexed_repos = checked_count - skipped_count
+    console.print(f"\n[green]Indexed {files_indexed} files from {indexed_repos} repos[/green]")
     if skipped_count > 0:
-        console.print(f"[dim]Skipped {skipped_count} cached repos (use --force to re-index)[/dim]")
+        console.print(f"[yellow]Skipped {skipped_count} cached repos[/yellow] [dim](use --force to re-index)[/dim]")
+    console.print(f"[dim]HTTP requests: {index.api.request_count}[/dim]")
 
 
 @cli.command()
@@ -163,6 +175,7 @@ def add(repo_id: str, revisions: int, rate: float | None, workers: int, force: b
                 console.print("[dim]Use --force to re-index[/dim]")
             else:
                 console.print(f"[green]Indexed {files_indexed} GGUF files from {repo_id}[/green]")
+            console.print(f"[dim]HTTP requests: {index.api.request_count}[/dim]")
         except Exception as e:
             console.print(f"[red]Error: {e}[/red]")
             sys.exit(1)
