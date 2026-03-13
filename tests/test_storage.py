@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from gguf_index.storage import GGUFEntry, JSONStorage, SQLiteStorage
+from gguf_index.storage import GGUFEntry, JSONStorage, SQLiteStorage, SchemaMigrationNeeded
 
 
 @pytest.fixture
@@ -179,3 +179,109 @@ class TestSQLiteRepoCache:
 
         assert storage.count() == 0
         assert storage.get_repo_cache("test/repo") is None
+
+
+class TestSchemaMigration:
+    def test_check_schema_version_new_db(self, temp_dir):
+        """New database should not need migration."""
+        storage = SQLiteStorage(temp_dir / "index.db")
+        version, needs_migration = storage.check_schema_version()
+        assert version is None
+        assert needs_migration is False
+
+    def test_check_schema_version_current(self, temp_dir):
+        """Current schema should not need migration."""
+        storage = SQLiteStorage(temp_dir / "index.db")
+        storage.load()  # Creates the schema
+        storage.close()
+
+        storage2 = SQLiteStorage(temp_dir / "index.db")
+        version, needs_migration = storage2.check_schema_version()
+        assert version == SQLiteStorage.SCHEMA_VERSION
+        assert needs_migration is False
+
+    def test_check_schema_version_old(self, temp_dir):
+        """Old schema should need migration."""
+        db_path = temp_dir / "index.db"
+
+        # Create a database with an old schema version
+        import sqlite3
+        conn = sqlite3.connect(db_path)
+        conn.execute("CREATE TABLE schema_version (version INTEGER PRIMARY KEY)")
+        conn.execute("INSERT INTO schema_version VALUES (3)")
+        conn.commit()
+        conn.close()
+
+        storage = SQLiteStorage(db_path)
+        version, needs_migration = storage.check_schema_version()
+        assert version == 3
+        assert needs_migration is True
+
+    def test_migration_raises_exception(self, temp_dir):
+        """Loading old schema without auto_migrate should raise exception."""
+        db_path = temp_dir / "index.db"
+
+        # Create a database with an old schema version
+        import sqlite3
+        conn = sqlite3.connect(db_path)
+        conn.execute("CREATE TABLE schema_version (version INTEGER PRIMARY KEY)")
+        conn.execute("INSERT INTO schema_version VALUES (3)")
+        conn.commit()
+        conn.close()
+
+        storage = SQLiteStorage(db_path, auto_migrate=False)
+        with pytest.raises(SchemaMigrationNeeded) as exc_info:
+            storage.load()
+
+        assert exc_info.value.current_version == 3
+        assert exc_info.value.required_version == SQLiteStorage.SCHEMA_VERSION
+
+    def test_backup_and_recreate(self, temp_dir, sample_entry):
+        """Backup should preserve old file and create new empty db."""
+        db_path = temp_dir / "index.db"
+
+        # Create a database with data
+        storage = SQLiteStorage(db_path)
+        storage.load()
+        storage.add(sample_entry)
+        storage.save()
+        storage.close()
+
+        # Backup and recreate
+        storage2 = SQLiteStorage(db_path)
+        backup_path = storage2.backup_and_recreate()
+
+        # Check backup exists
+        assert backup_path.exists()
+        assert "backup" in backup_path.name
+
+        # Check old data is in backup
+        import sqlite3
+        conn = sqlite3.connect(backup_path)
+        count = conn.execute("SELECT COUNT(*) FROM gguf_files").fetchone()[0]
+        conn.close()
+        assert count == 1
+
+        # Check new db is empty
+        storage3 = SQLiteStorage(db_path)
+        storage3.load()
+        assert storage3.count() == 0
+
+    def test_backup_creates_unique_names(self, temp_dir):
+        """Multiple backups should get unique names."""
+        db_path = temp_dir / "index.db"
+
+        # Create initial db
+        storage = SQLiteStorage(db_path)
+        storage.load()
+        storage.close()
+
+        # Create multiple backups
+        backup1 = SQLiteStorage(db_path).backup_and_recreate()
+        SQLiteStorage(db_path).load()  # Recreate db
+
+        backup2 = SQLiteStorage(db_path).backup_and_recreate()
+
+        assert backup1 != backup2
+        assert backup1.exists()
+        assert backup2.exists()

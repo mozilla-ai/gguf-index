@@ -11,6 +11,7 @@ from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskPr
 from rich.table import Table
 
 from .index import GGUFIndex, DEFAULT_JSON_PATH, DEFAULT_SQLITE_PATH
+from .storage import SchemaMigrationNeeded, SQLiteStorage
 
 console = Console()
 
@@ -41,6 +42,25 @@ def get_index(
     # Default to SQLite-only if neither specified
     if not json_p and not sqlite_p:
         sqlite_p = DEFAULT_SQLITE_PATH
+
+    # Check for schema migration before creating index
+    if sqlite_p:
+        storage = SQLiteStorage(sqlite_p)
+        current_version, needs_migration = storage.check_schema_version()
+        if needs_migration and current_version is not None:
+            console.print(
+                f"[yellow]Database schema migration needed: v{current_version} -> v{SQLiteStorage.SCHEMA_VERSION}[/yellow]"
+            )
+            console.print(f"[dim]Database: {sqlite_p}[/dim]")
+            console.print(
+                "\nThe existing database will be backed up and a new one created."
+            )
+            if not click.confirm("Proceed with migration?", default=True):
+                console.print("[red]Aborted.[/red]")
+                sys.exit(1)
+
+            backup_path = storage.backup_and_recreate()
+            console.print(f"[green]Backed up old database to: {backup_path}[/green]")
 
     # Get token from argument or environment
     token = get_hf_token(hf_token)

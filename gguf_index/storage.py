@@ -173,6 +173,18 @@ class JSONStorage(StorageBackend):
         return self._data.copy()
 
 
+class SchemaMigrationNeeded(Exception):
+    """Raised when database schema needs migration."""
+
+    def __init__(self, current_version: int, required_version: int, db_path: Path):
+        self.current_version = current_version
+        self.required_version = required_version
+        self.db_path = db_path
+        super().__init__(
+            f"Database schema migration needed: v{current_version} -> v{required_version}"
+        )
+
+
 class SQLiteStorage(StorageBackend):
     """SQLite storage backend for fast lookups.
 
@@ -183,9 +195,10 @@ class SQLiteStorage(StorageBackend):
 
     SCHEMA_VERSION = 5
 
-    def __init__(self, path: str | Path):
+    def __init__(self, path: str | Path, auto_migrate: bool = False):
         self.path = Path(path)
         self._conn: sqlite3.Connection | None = None
+        self._auto_migrate = auto_migrate
 
     def _get_conn(self) -> sqlite3.Connection:
         if self._conn is None:
@@ -194,6 +207,53 @@ class SQLiteStorage(StorageBackend):
             self._conn.row_factory = sqlite3.Row
             self._init_schema()
         return self._conn
+
+    def check_schema_version(self) -> tuple[int | None, bool]:
+        """Check schema version without modifying the database.
+
+        Returns:
+            Tuple of (current_version, needs_migration).
+            current_version is None if database doesn't exist or has no schema.
+        """
+        if not self.path.exists():
+            return None, False
+
+        conn = sqlite3.connect(self.path)
+        try:
+            cursor = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='schema_version'"
+            )
+            if not cursor.fetchone():
+                return None, True  # Old DB without version table
+
+            version = conn.execute("SELECT version FROM schema_version").fetchone()[0]
+            return version, version != self.SCHEMA_VERSION
+        finally:
+            conn.close()
+
+    def backup_and_recreate(self) -> Path:
+        """Backup the existing database and create a fresh one.
+
+        Returns:
+            Path to the backup file.
+        """
+        if self._conn:
+            self._conn.close()
+            self._conn = None
+
+        # Find a unique backup name
+        version, _ = self.check_schema_version()
+        version_str = f".v{version}" if version else ""
+        backup_path = self.path.with_suffix(f"{version_str}.backup")
+        counter = 1
+        while backup_path.exists():
+            backup_path = self.path.with_suffix(f"{version_str}.backup.{counter}")
+            counter += 1
+
+        # Rename old file to backup
+        self.path.rename(backup_path)
+
+        return backup_path
 
     def _init_schema(self) -> None:
         """Initialize or verify the database schema."""
@@ -205,7 +265,12 @@ class SQLiteStorage(StorageBackend):
             version = conn.execute("SELECT version FROM schema_version").fetchone()[0]
             if version == self.SCHEMA_VERSION:
                 return  # Already at current version
-            # Old version - drop and recreate
+
+            # Old version - need migration
+            if not self._auto_migrate:
+                raise SchemaMigrationNeeded(version, self.SCHEMA_VERSION, self.path)
+
+            # Auto-migrate by dropping and recreating (legacy behavior)
             conn.execute("DROP TABLE IF EXISTS gguf_files")
             conn.execute("DROP TABLE IF EXISTS repos")
             conn.execute("DROP TABLE IF EXISTS schema_version")
