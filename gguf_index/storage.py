@@ -418,3 +418,45 @@ class SQLiteStorage(StorageBackend):
         conn.execute("DELETE FROM gguf_files")
         conn.execute("DELETE FROM repos")
         conn.commit()
+
+    def get_all_repo_cache(self) -> list[dict[str, Any]]:
+        """Get all cached repo info.
+
+        Returns:
+            List of dicts with repo_id, last_indexed_commit, last_indexed_at, max_revisions_indexed
+        """
+        rows = self._get_conn().execute(
+            "SELECT repo_id, last_indexed_commit, last_indexed_at, max_revisions_indexed FROM repos"
+        ).fetchall()
+        return [
+            {
+                "repo_id": row["repo_id"],
+                "last_indexed_commit": row["last_indexed_commit"],
+                "last_indexed_at": row["last_indexed_at"],
+                "max_revisions_indexed": row["max_revisions_indexed"],
+            }
+            for row in rows
+        ]
+
+    def import_repo_cache(self, repos: list[dict[str, Any]]) -> int:
+        """Import repo cache entries.
+
+        Args:
+            repos: List of dicts with repo_id, last_indexed_commit, last_indexed_at, max_revisions_indexed
+
+        Returns:
+            Number of repos imported
+        """
+        conn = self._get_conn()
+        count = 0
+        for repo in repos:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO repos (repo_id, last_indexed_commit, last_indexed_at, max_revisions_indexed)
+                VALUES (?, ?, ?, ?)
+                """,
+                (repo["repo_id"], repo["last_indexed_commit"], repo["last_indexed_at"], repo.get("max_revisions_indexed")),
+            )
+            count += 1
+        conn.commit()
+        return count

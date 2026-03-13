@@ -306,10 +306,17 @@ def export_cmd(output: str | None, fmt: str, push: bool, repo: str, token: str |
 
         output_path = Path(output) if output else Path("gguf_index.parquet")
 
+        # Get repos cache if SQLite backend is available
+        repos = None
+        if index.sqlite_storage:
+            repos = index.sqlite_storage.get_all_repo_cache()
+
         with console.status(f"Exporting {len(entries)} entries to parquet..."):
-            export_to_parquet(entries, output_path)
+            repos_path = export_to_parquet(entries, output_path, repos=repos)
 
         console.print(f"[green]Exported {len(entries)} entries to {output_path}[/green]")
+        if repos_path and repos:
+            console.print(f"[green]Exported {len(repos)} cached repos to {repos_path}[/green]")
 
         if push:
             hf_token = get_hf_token(token)
@@ -359,17 +366,18 @@ def import_cmd(source: str | None, repo: str, fmt: str | None, merge: bool, toke
     SOURCE is a local file path. If not provided, downloads from --repo.
     Format is auto-detected from extension (.parquet or .jsonl).
     """
-    from .parquet import download_from_hf, import_from_parquet
+    from .parquet import download_from_hf, import_from_parquet, import_repos_from_parquet
     from .storage import GGUFEntry
 
     index = get_index(json_path, sqlite_path, use_json, use_sqlite)
     hf_token = get_hf_token(token)
 
     # Determine source
+    repos_path = None
     if source is None:
         # Download from HuggingFace
         with console.status(f"Downloading from {repo}..."):
-            source_path = download_from_hf(repo, token=hf_token)
+            source_path, repos_path = download_from_hf(repo, token=hf_token)
         console.print(f"[dim]Downloaded from {repo}[/dim]")
         detected_fmt = "parquet"
     else:
@@ -406,7 +414,15 @@ def import_cmd(source: str | None, repo: str, fmt: str | None, merge: bool, toke
                     errors += 1
                     if errors <= 5:
                         console.print(f"[yellow]Error: {e}[/yellow]")
+
+        # Import repos cache if available
+        repos_imported = 0
+        if index.sqlite_storage:
+            repos = import_repos_from_parquet(repos_path if repos_path else source_path)
+            if repos:
+                repos_imported = index.sqlite_storage.import_repo_cache(repos)
     else:  # jsonl
+        repos_imported = 0  # JSONL doesn't support repos cache
         with open(source_path, "r") as f:
             with console.status("Importing from JSONL...") as status:
                 for line_num, line in enumerate(f, 1):
@@ -427,6 +443,8 @@ def import_cmd(source: str | None, repo: str, fmt: str | None, merge: bool, toke
 
     index.save()
     console.print(f"[green]Imported {imported} entries[/green]")
+    if repos_imported:
+        console.print(f"[green]Imported {repos_imported} cached repos[/green]")
     if errors:
         console.print(f"[yellow]Skipped {errors} invalid entries[/yellow]")
 

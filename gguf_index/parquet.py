@@ -1,7 +1,7 @@
 """Parquet import/export utilities for GGUF Index."""
 
 from pathlib import Path
-from typing import Iterator
+from typing import Any, Iterator
 
 import pandas as pd
 from huggingface_hub import HfApi, hf_hub_download
@@ -9,12 +9,25 @@ from huggingface_hub import HfApi, hf_hub_download
 from .storage import GGUFEntry
 
 
-def export_to_parquet(entries: list[GGUFEntry], path: Path) -> None:
-    """Export entries to parquet with Xet optimization.
+def _get_repos_path(data_path: Path) -> Path:
+    """Get the repos cache file path derived from the data file path."""
+    return data_path.with_suffix(".repos.parquet")
+
+
+def export_to_parquet(
+    entries: list[GGUFEntry],
+    path: Path,
+    repos: list[dict[str, Any]] | None = None,
+) -> Path | None:
+    """Export entries and optionally repos cache to parquet.
 
     Args:
         entries: List of GGUFEntry objects to export
         path: Output path for the parquet file
+        repos: Optional list of repo cache dicts to export
+
+    Returns:
+        Path to repos file if exported, None otherwise
     """
     if not entries:
         # Create empty DataFrame with correct schema
@@ -34,6 +47,22 @@ def export_to_parquet(entries: list[GGUFEntry], path: Path) -> None:
         use_content_defined_chunking=True,
         write_page_index=True,
     )
+
+    # Export repos cache if provided
+    repos_path = None
+    if repos is not None:
+        repos_path = _get_repos_path(path)
+        if repos:
+            repos_df = pd.DataFrame(repos)
+        else:
+            repos_df = pd.DataFrame(columns=["repo_id", "last_indexed_commit", "last_indexed_at", "max_revisions_indexed"])
+        repos_df.to_parquet(
+            repos_path,
+            index=False,
+            engine="pyarrow",
+        )
+
+    return repos_path
 
 
 def import_from_parquet(path: Path) -> Iterator[GGUFEntry]:
@@ -58,12 +87,39 @@ def import_from_parquet(path: Path) -> Iterator[GGUFEntry]:
         )
 
 
+def import_repos_from_parquet(path: Path) -> list[dict[str, Any]]:
+    """Import repos cache from parquet file.
+
+    Args:
+        path: Path to the repos parquet file
+
+    Returns:
+        List of repo cache dicts
+    """
+    repos_path = _get_repos_path(path) if not path.name.endswith(".repos.parquet") else path
+
+    if not repos_path.exists():
+        return []
+
+    df = pd.read_parquet(repos_path, engine="pyarrow")
+
+    repos = []
+    for _, row in df.iterrows():
+        repos.append({
+            "repo_id": row["repo_id"],
+            "last_indexed_commit": row["last_indexed_commit"],
+            "last_indexed_at": row["last_indexed_at"],
+            "max_revisions_indexed": row.get("max_revisions_indexed"),
+        })
+    return repos
+
+
 def download_from_hf(
     repo: str = "mozilla-ai/gguf-index",
     filename: str = "data.parquet",
     token: str | None = None,
-) -> Path:
-    """Download parquet from HF dataset repo.
+) -> tuple[Path, Path | None]:
+    """Download parquet files from HF dataset repo.
 
     Args:
         repo: HuggingFace dataset repository ID
@@ -71,15 +127,29 @@ def download_from_hf(
         token: Optional HuggingFace token for private repos
 
     Returns:
-        Path to the downloaded parquet file
+        Tuple of (data_path, repos_path) where repos_path may be None if not found
     """
-    path = hf_hub_download(
+    data_path = Path(hf_hub_download(
         repo_id=repo,
         filename=filename,
         repo_type="dataset",
         token=token,
-    )
-    return Path(path)
+    ))
+
+    # Try to download repos cache file
+    repos_filename = filename.replace(".parquet", ".repos.parquet")
+    repos_path = None
+    try:
+        repos_path = Path(hf_hub_download(
+            repo_id=repo,
+            filename=repos_filename,
+            repo_type="dataset",
+            token=token,
+        ))
+    except Exception:
+        pass  # Repos file is optional
+
+    return data_path, repos_path
 
 
 def push_to_hf(
@@ -89,7 +159,9 @@ def push_to_hf(
     token: str | None = None,
     commit_message: str = "Update gguf-index",
 ) -> str:
-    """Push parquet file to HF dataset repo.
+    """Push parquet files to HF dataset repo.
+
+    Uploads both the data file and repos cache file (if exists).
 
     Args:
         path: Path to the local parquet file
@@ -99,14 +171,14 @@ def push_to_hf(
         commit_message: Commit message for the upload
 
     Returns:
-        URL of the uploaded file
+        URL of the uploaded data file
     """
     api = HfApi(token=token)
 
     # Create repo if it doesn't exist
     api.create_repo(repo_id=repo, repo_type="dataset", exist_ok=True)
 
-    # Upload the file
+    # Upload the data file
     api.upload_file(
         path_or_fileobj=str(path),
         path_in_repo=filename,
@@ -114,5 +186,17 @@ def push_to_hf(
         repo_type="dataset",
         commit_message=commit_message,
     )
+
+    # Upload repos cache file if it exists
+    repos_path = _get_repos_path(path)
+    if repos_path.exists():
+        repos_filename = filename.replace(".parquet", ".repos.parquet")
+        api.upload_file(
+            path_or_fileobj=str(repos_path),
+            path_in_repo=repos_filename,
+            repo_id=repo,
+            repo_type="dataset",
+            commit_message=f"{commit_message} (repos cache)",
+        )
 
     return f"https://huggingface.co/datasets/{repo}/blob/main/{filename}"
