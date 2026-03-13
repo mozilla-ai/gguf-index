@@ -201,21 +201,18 @@ class GGUFIndex:
 
         for i, repo in enumerate(repos):
             repo_id = repo["repo_id"]
+            current_commit = repo["sha"]  # Already available from search results
 
             if progress_callback:
                 progress_callback(repo_id, i + 1, total_repos)
 
+            # Check cache using sha from search results (no extra API call needed)
+            if not force and self._should_skip_repo(repo_id, current_commit, max_revisions):
+                if skip_callback:
+                    skip_callback(repo_id, current_commit)
+                continue
+
             try:
-                # Get current HEAD commit
-                repo_info = self.api.repo_info(repo_id, files_metadata=False)
-                current_commit = repo_info.sha
-
-                # Check cache
-                if not force and self._should_skip_repo(repo_id, current_commit, max_revisions):
-                    if skip_callback:
-                        skip_callback(repo_id, current_commit)
-                    continue
-
                 # Index the repo
                 repo_files = 0
                 for file_info in self.api.get_repo_gguf_files(repo_id, max_revisions=max_revisions):

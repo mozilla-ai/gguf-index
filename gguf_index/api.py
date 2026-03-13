@@ -143,11 +143,12 @@ class HuggingFaceAPI:
             limit: Maximum number of repos to return
 
         Yields:
-            Repository information dictionaries
+            Repository information dictionaries including sha (commit hash)
         """
         search_kwargs: dict[str, Any] = {
             "filter": "gguf",
             "sort": "downloads",
+            "full": True,  # Get sha and last_modified for cache optimization
         }
         if query:
             search_kwargs["search"] = query
@@ -163,6 +164,8 @@ class HuggingFaceAPI:
                 "downloads": model.downloads,
                 "likes": model.likes,
                 "tags": model.tags,
+                "sha": model.sha,  # Current HEAD commit
+                "last_modified": model.last_modified,
             }
             count += 1
 
