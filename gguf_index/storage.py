@@ -5,7 +5,10 @@ import sqlite3
 from abc import ABC, abstractmethod
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from collections.abc import Callable, Iterator
 
 
 class GGUFEntry:
@@ -459,6 +462,149 @@ class SQLiteStorage(StorageBackend):
             )
             count += 1
         conn.commit()
+        return count
+
+    def bulk_import(
+        self,
+        entries: list[GGUFEntry],
+        progress_callback: "Callable[[int], None] | None" = None,
+        batch_size: int = 10000,
+    ) -> int:
+        """Bulk import entries with optimizations for speed.
+
+        Uses batched inserts, deferred indexing, and relaxed durability
+        settings for maximum import speed.
+
+        Args:
+            entries: List of GGUFEntry objects to import
+            progress_callback: Optional callback(count) called after each batch
+            batch_size: Number of entries per batch
+
+        Returns:
+            Number of entries imported
+        """
+        conn = self._get_conn()
+
+        # Optimize for bulk import
+        conn.execute("PRAGMA synchronous = OFF")
+        conn.execute("PRAGMA journal_mode = MEMORY")
+
+        # Drop indexes for faster inserts
+        conn.execute("DROP INDEX IF EXISTS idx_sha256")
+        conn.execute("DROP INDEX IF EXISTS idx_repo_id")
+
+        try:
+            # Prepare data as tuples for executemany
+            count = 0
+            batch = []
+
+            for entry in entries:
+                batch.append((
+                    entry.repo_id,
+                    entry.revision,
+                    entry.filename,
+                    entry.sha256,
+                    entry.size,
+                    entry.indexed_at,
+                ))
+
+                if len(batch) >= batch_size:
+                    conn.executemany(
+                        """
+                        INSERT OR REPLACE INTO gguf_files
+                        (repo_id, revision, filename, sha256, size, indexed_at)
+                        VALUES (?, ?, ?, ?, ?, ?)
+                        """,
+                        batch,
+                    )
+                    conn.commit()
+                    count += len(batch)
+                    if progress_callback:
+                        progress_callback(count)
+                    batch = []
+
+            # Insert remaining entries
+            if batch:
+                conn.executemany(
+                    """
+                    INSERT OR REPLACE INTO gguf_files
+                    (repo_id, revision, filename, sha256, size, indexed_at)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    batch,
+                )
+                conn.commit()
+                count += len(batch)
+                if progress_callback:
+                    progress_callback(count)
+
+        finally:
+            # Recreate indexes
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_sha256 ON gguf_files(sha256)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_repo_id ON gguf_files(repo_id)")
+
+            # Restore safe settings
+            conn.execute("PRAGMA synchronous = FULL")
+            conn.execute("PRAGMA journal_mode = DELETE")
+            conn.commit()
+
+        return count
+
+    def bulk_import_batches(
+        self,
+        batch_iterator: "Iterator[tuple[list[tuple], int]]",
+        progress_callback: "Callable[[int, int], None] | None" = None,
+    ) -> int:
+        """Streaming bulk import from pre-batched tuples.
+
+        Memory-efficient: processes one batch at a time without loading
+        all data into memory.
+
+        Args:
+            batch_iterator: Iterator yielding (batch_of_tuples, total_rows).
+                Each tuple is (repo_id, revision, filename, sha256, size, indexed_at)
+            progress_callback: Optional callback(imported_count, total_count)
+
+        Returns:
+            Number of entries imported
+        """
+        conn = self._get_conn()
+
+        # Optimize for bulk import
+        conn.execute("PRAGMA synchronous = OFF")
+        conn.execute("PRAGMA journal_mode = MEMORY")
+
+        # Drop indexes for faster inserts
+        conn.execute("DROP INDEX IF EXISTS idx_sha256")
+        conn.execute("DROP INDEX IF EXISTS idx_repo_id")
+
+        try:
+            count = 0
+
+            for batch, total in batch_iterator:
+                conn.executemany(
+                    """
+                    INSERT OR REPLACE INTO gguf_files
+                    (repo_id, revision, filename, sha256, size, indexed_at)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    batch,
+                )
+                conn.commit()
+                count += len(batch)
+                if progress_callback:
+                    progress_callback(count, total)
+
+        finally:
+            # Recreate indexes
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_sha256 ON gguf_files(sha256)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_repo_id ON gguf_files(repo_id)")
+
+            # Restore safe settings
+            conn.execute("PRAGMA synchronous = FULL")
+            conn.execute("PRAGMA journal_mode = DELETE")
+            conn.commit()
+
         return count
 
     def get_stats(self) -> dict[str, Any]:

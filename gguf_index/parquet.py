@@ -87,6 +87,47 @@ def import_from_parquet(path: Path) -> Iterator[GGUFEntry]:
         )
 
 
+def iter_parquet_batches(
+    path: Path,
+    batch_size: int = 10000,
+) -> Iterator[tuple[list[tuple], int]]:
+    """Stream parquet file in batches for bulk import.
+
+    Memory-efficient: only one batch is loaded at a time.
+    Returns raw tuples ready for SQL insertion (no GGUFEntry overhead).
+
+    Args:
+        path: Path to the parquet file
+        batch_size: Number of rows per batch
+
+    Yields:
+        Tuple of (batch_of_tuples, total_rows) where each tuple is
+        (repo_id, revision, filename, sha256, size, indexed_at)
+    """
+    import pyarrow.parquet as pq
+
+    parquet_file = pq.ParquetFile(path)
+    total_rows = parquet_file.metadata.num_rows
+
+    for batch in parquet_file.iter_batches(batch_size=batch_size):
+        # Convert to pandas for easier row access
+        df = batch.to_pandas()
+
+        rows = [
+            (
+                row["repo_id"],
+                row["revision"],
+                row["filename"],
+                row["sha256"],
+                int(row["size"]),
+                row.get("indexed_at"),
+            )
+            for _, row in df.iterrows()
+        ]
+
+        yield rows, total_rows
+
+
 def import_repos_from_parquet(path: Path) -> list[dict[str, Any]]:
     """Import repos cache from parquet file.
 

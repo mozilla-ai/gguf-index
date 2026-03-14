@@ -455,17 +455,42 @@ def import_cmd(source: str | None, repo: str, fmt: str | None, merge: bool, repl
     errors = 0
 
     if detected_fmt == "parquet":
-        with console.status("Importing from parquet...") as status:
-            for entry in import_from_parquet(source_path):
-                try:
-                    index.add(entry)
-                    imported += 1
-                    if imported % 10000 == 0:
-                        status.update(f"Imported {imported} entries...")
-                except Exception as e:
-                    errors += 1
-                    if errors <= 5:
-                        console.print(f"[yellow]Error: {e}[/yellow]")
+        # Use optimized streaming bulk import for SQLite
+        if index.sqlite_storage:
+            from .parquet import iter_parquet_batches
+
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                BarColumn(),
+                TaskProgressColumn(),
+                console=console,
+            ) as progress:
+                task = None
+
+                def update_progress(count: int, total: int) -> None:
+                    nonlocal task
+                    if task is None:
+                        task = progress.add_task("Importing...", total=total)
+                    progress.update(task, completed=count)
+
+                imported = index.sqlite_storage.bulk_import_batches(
+                    iter_parquet_batches(source_path),
+                    progress_callback=update_progress,
+                )
+        else:
+            # Fallback for non-SQLite backends
+            with console.status("Importing from parquet...") as status:
+                for entry in import_from_parquet(source_path):
+                    try:
+                        index.add(entry)
+                        imported += 1
+                        if imported % 10000 == 0:
+                            status.update(f"Imported {imported} entries...")
+                    except Exception as e:
+                        errors += 1
+                        if errors <= 5:
+                            console.print(f"[yellow]Error: {e}[/yellow]")
 
         # Import repos cache if available
         repos_imported = 0
