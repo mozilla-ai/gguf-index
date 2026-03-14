@@ -1,17 +1,107 @@
 """Parquet import/export utilities for GGUF Index."""
 
 from pathlib import Path
-from typing import Any, Iterator
+from typing import TYPE_CHECKING, Any, Iterator
 
 import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 from huggingface_hub import CommitOperationAdd, HfApi, hf_hub_download
 
 from .storage import GGUFEntry
+
+if TYPE_CHECKING:
+    import sqlite3
+    from collections.abc import Callable
 
 
 def _get_repos_path(data_path: Path) -> Path:
     """Get the repos cache file path derived from the data file path."""
     return data_path.with_suffix(".repos.parquet")
+
+
+# Schema for gguf_files parquet export
+GGUF_SCHEMA = pa.schema([
+    ("sha256", pa.string()),
+    ("repo_id", pa.string()),
+    ("revision", pa.string()),
+    ("filename", pa.string()),
+    ("size", pa.int64()),
+    ("indexed_at", pa.string()),
+])
+
+
+def export_from_sqlite_streaming(
+    conn: "sqlite3.Connection",
+    path: Path,
+    batch_size: int = 50000,
+    progress_callback: "Callable[[int, int], None] | None" = None,
+) -> int:
+    """Stream export from SQLite to parquet without loading all data into memory.
+
+    Uses pandas read_sql with chunking and PyArrow ParquetWriter for
+    incremental writing. Maintains Xet CDC optimization.
+
+    Args:
+        conn: SQLite connection
+        path: Output parquet file path
+        batch_size: Number of rows per batch
+        progress_callback: Optional callback(exported_count, total_count)
+
+    Returns:
+        Number of entries exported
+    """
+    # Get total count for progress
+    total = conn.execute("SELECT COUNT(*) FROM gguf_files").fetchone()[0]
+
+    if total == 0:
+        # Create empty parquet with correct schema
+        empty_table = pa.Table.from_pydict(
+            {col: [] for col in ["sha256", "repo_id", "revision", "filename", "size", "indexed_at"]},
+            schema=GGUF_SCHEMA,
+        )
+        pq.write_table(empty_table, path, use_content_defined_chunking=True, write_page_index=True)
+        return 0
+
+    # Ensure parent directory exists
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Query for streaming read - ORDER BY primary key for consistent chunk boundaries
+    # This ensures Xet CDC deduplication works properly on incremental updates
+    query = """
+        SELECT sha256, repo_id, revision, filename, size, indexed_at
+        FROM gguf_files
+        ORDER BY repo_id, revision, filename
+    """
+
+    writer = None
+    exported = 0
+
+    try:
+        for chunk_df in pd.read_sql_query(query, conn, chunksize=batch_size):
+            # Convert to PyArrow table
+            table = pa.Table.from_pandas(chunk_df, schema=GGUF_SCHEMA, preserve_index=False)
+
+            if writer is None:
+                # Initialize writer with first chunk
+                writer = pq.ParquetWriter(
+                    path,
+                    schema=GGUF_SCHEMA,
+                    use_content_defined_chunking=True,
+                    write_page_index=True,
+                )
+
+            writer.write_table(table)
+            exported += len(chunk_df)
+
+            if progress_callback:
+                progress_callback(exported, total)
+
+    finally:
+        if writer is not None:
+            writer.close()
+
+    return exported
 
 
 def export_to_parquet(

@@ -310,10 +310,9 @@ def export_cmd(output: str | None, fmt: str, push: bool, repo: str, token: str |
     Default format is Parquet, optimized for HuggingFace datasets with Xet storage.
     Use --push to upload directly to a HuggingFace dataset repository.
     """
-    from .parquet import export_to_parquet, push_to_hf
+    from .parquet import export_from_sqlite_streaming, export_to_parquet, push_to_hf
 
     index = get_index(json_path, sqlite_path, use_json, use_sqlite)
-    entries = index.get_all()
 
     if fmt == "parquet":
         if not output and not push:
@@ -322,17 +321,48 @@ def export_cmd(output: str | None, fmt: str, push: bool, repo: str, token: str |
 
         output_path = Path(output) if output else Path("gguf_index.parquet")
 
-        # Get repos cache if SQLite backend is available
-        repos = None
+        # Use streaming export for SQLite (memory efficient)
         if index.sqlite_storage:
             repos = index.sqlite_storage.get_all_repo_cache()
 
-        with console.status(f"Exporting {len(entries)} entries to parquet..."):
-            repos_path = export_to_parquet(entries, output_path, repos=repos)
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                BarColumn(),
+                TaskProgressColumn(),
+                console=console,
+            ) as progress:
+                task = None
 
-        console.print(f"[green]Exported {len(entries)} entries to {output_path}[/green]")
-        if repos_path and repos:
-            console.print(f"[green]Exported {len(repos)} cached repos to {repos_path}[/green]")
+                def update_progress(count: int, total: int) -> None:
+                    nonlocal task
+                    if task is None:
+                        task = progress.add_task("Exporting...", total=total)
+                    progress.update(task, completed=count)
+
+                conn = index.sqlite_storage._get_conn()
+                exported = export_from_sqlite_streaming(
+                    conn, output_path, progress_callback=update_progress
+                )
+
+            # Export repos cache
+            repos_path = None
+            if repos:
+                import pandas as pd
+                from .parquet import _get_repos_path
+                repos_path = _get_repos_path(output_path)
+                repos_df = pd.DataFrame(repos)
+                repos_df.to_parquet(repos_path, index=False, engine="pyarrow")
+
+            console.print(f"[green]Exported {exported:,} entries to {output_path}[/green]")
+            if repos_path and repos:
+                console.print(f"[green]Exported {len(repos):,} cached repos to {repos_path}[/green]")
+        else:
+            # Fallback for non-SQLite backends
+            entries = index.get_all()
+            with console.status(f"Exporting {len(entries)} entries to parquet..."):
+                repos_path = export_to_parquet(entries, output_path, repos=None)
+            console.print(f"[green]Exported {len(entries)} entries to {output_path}[/green]")
 
         if push:
             hf_token = get_hf_token(token)
@@ -345,6 +375,7 @@ def export_cmd(output: str | None, fmt: str, push: bool, repo: str, token: str |
             console.print(f"[green]Pushed to {url}[/green]")
 
     elif fmt == "jsonl":
+        entries = index.get_all()
         lines = [json.dumps(entry.to_dict(), separators=(",", ":")) for entry in entries]
         content = "\n".join(lines)
         if output:
@@ -356,6 +387,7 @@ def export_cmd(output: str | None, fmt: str, push: bool, repo: str, token: str |
             click.echo(content)
 
     else:  # json
+        entries = index.get_all()
         data = {f"{e.repo_id}/{e.revision}/{e.filename}": e.to_dict() for e in entries}
         if output:
             with open(output, "w") as f:
