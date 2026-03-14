@@ -369,13 +369,14 @@ def export_cmd(output: str | None, fmt: str, push: bool, repo: str, token: str |
 @click.argument("source", required=False)
 @click.option("--repo", default="mozilla-ai/gguf-index", help="HuggingFace dataset repo to download from")
 @click.option("--format", "-f", "fmt", type=click.Choice(["parquet", "jsonl"]), default=None, help="Input format (auto-detected from extension)")
-@click.option("--merge", is_flag=True, help="Merge with existing data (default: replace)")
+@click.option("--merge", is_flag=True, help="Merge with existing data (default: prompt if data exists)")
+@click.option("--replace", is_flag=True, help="Replace existing data without prompting")
 @click.option("--token", "-t", type=str, default=None, help="HuggingFace API token (or set HF_TOKEN env var)")
 @click.option("--json-path", type=click.Path(), help="Path to JSON index file")
 @click.option("--sqlite-path", type=click.Path(), help="Path to SQLite database file")
 @click.option("--json/--no-json", "use_json", default=False, help="Also use JSON storage (opt-in)")
 @click.option("--sqlite/--no-sqlite", "use_sqlite", default=True, help="Use SQLite storage")
-def import_cmd(source: str | None, repo: str, fmt: str | None, merge: bool, token: str | None, json_path: str | None, sqlite_path: str | None, use_json: bool, use_sqlite: bool):
+def import_cmd(source: str | None, repo: str, fmt: str | None, merge: bool, replace: bool, token: str | None, json_path: str | None, sqlite_path: str | None, use_json: bool, use_sqlite: bool):
     """Import index from parquet file or HuggingFace dataset.
 
     SOURCE is a local file path. If not provided, downloads from --repo.
@@ -386,6 +387,35 @@ def import_cmd(source: str | None, repo: str, fmt: str | None, merge: bool, toke
 
     index = get_index(json_path, sqlite_path, use_json, use_sqlite)
     hf_token = get_hf_token(token)
+
+    # Check for existing data and prompt user if needed
+    existing_count = index.count()
+    do_merge = merge
+    do_backup = False
+
+    if existing_count > 0 and not merge and not replace:
+        # Existing data found, prompt user
+        console.print(f"[yellow]Existing index found with {existing_count:,} entries[/yellow]")
+        if index.sqlite_storage:
+            console.print(f"[dim]Database: {index.sqlite_storage.path}[/dim]")
+
+        console.print("\nHow would you like to proceed?")
+        console.print("  [cyan]1[/cyan] - Backup existing index and replace with imported data")
+        console.print("  [cyan]2[/cyan] - Replace without backup (overwrite)")
+        console.print("  [cyan]3[/cyan] - Merge imported data into existing index")
+        console.print("  [cyan]4[/cyan] - Abort")
+
+        choice = click.prompt("Choose an option", type=click.Choice(["1", "2", "3", "4"]), default="1")
+
+        if choice == "1":
+            do_backup = True
+        elif choice == "2":
+            pass  # Just replace
+        elif choice == "3":
+            do_merge = True
+        else:
+            console.print("[red]Aborted.[/red]")
+            sys.exit(1)
 
     # Determine source
     repos_path = None
@@ -408,8 +438,15 @@ def import_cmd(source: str | None, repo: str, fmt: str | None, merge: bool, toke
         else:
             detected_fmt = "jsonl"
 
+    # Handle backup if requested
+    if do_backup and index.sqlite_storage:
+        backup_path = index.sqlite_storage.backup_and_recreate()
+        console.print(f"[green]Backed up old database to: {backup_path}[/green]")
+        # Reload the index with fresh database
+        index = get_index(json_path, sqlite_path, use_json, use_sqlite)
+
     # Clear existing data if not merging
-    if not merge:
+    if not do_merge:
         if index.sqlite_storage:
             index.sqlite_storage.clear_all()
         console.print("[dim]Replacing existing index data[/dim]")
