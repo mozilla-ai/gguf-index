@@ -299,12 +299,13 @@ def identify(file_paths: tuple[str, ...], json_path: str | None, sqlite_path: st
 @click.option("--format", "-f", "fmt", type=click.Choice(["parquet", "json", "jsonl"]), default="parquet", help="Output format (default: parquet)")
 @click.option("--push", is_flag=True, help="Push to HuggingFace dataset repo after export")
 @click.option("--repo", default="mozilla-ai/gguf-index", help="HuggingFace dataset repo for push")
+@click.option("--message", "-m", type=str, default=None, help="Commit message for push (default: 'Update gguf-index')")
 @click.option("--token", "-t", type=str, default=None, help="HuggingFace API token for push (or set HF_TOKEN env var)")
 @click.option("--json-path", type=click.Path(), help="Path to JSON index file")
 @click.option("--sqlite-path", type=click.Path(), help="Path to SQLite database file")
 @click.option("--json/--no-json", "use_json", default=False, help="Also use JSON storage (opt-in)")
 @click.option("--sqlite/--no-sqlite", "use_sqlite", default=True, help="Use SQLite storage")
-def export_cmd(output: str | None, fmt: str, push: bool, repo: str, token: str | None, json_path: str | None, sqlite_path: str | None, use_json: bool, use_sqlite: bool):
+def export_cmd(output: str | None, fmt: str, push: bool, repo: str, message: str | None, token: str | None, json_path: str | None, sqlite_path: str | None, use_json: bool, use_sqlite: bool):
     """Export the index for sharing.
 
     Default format is Parquet, optimized for HuggingFace datasets with Xet storage.
@@ -371,7 +372,7 @@ def export_cmd(output: str | None, fmt: str, push: bool, repo: str, token: str |
                 sys.exit(1)
 
             console.print(f"Pushing to {repo}...")
-            url = push_to_hf(output_path, repo, token=hf_token)
+            url = push_to_hf(output_path, repo, token=hf_token, commit_message=message or "Update gguf-index")
             console.print(f"[green]Pushed to {url}[/green]")
 
     elif fmt == "jsonl":
