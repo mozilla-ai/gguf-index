@@ -35,6 +35,9 @@ gguf-index search "llama"
 
 # Limit the number of repos to index
 gguf-index search --limit 10
+
+# Force re-indexing (bypasses cache)
+gguf-index search --force
 ```
 
 ### Add a Specific Repository
@@ -43,7 +46,12 @@ Index all GGUF files from a specific HuggingFace repository:
 
 ```bash
 gguf-index add TheBloke/Llama-2-7B-GGUF
+
+# Force re-indexing even if already cached
+gguf-index add TheBloke/Llama-2-7B-GGUF --force
 ```
+
+Repositories are cached after indexing. Re-running the same command will skip unchanged repos (same HEAD commit). Use `--force` to re-index anyway.
 
 ### Look Up a File by SHA256
 
@@ -59,14 +67,43 @@ Compute the SHA256 of a local file and look it up in the index:
 gguf-index identify /path/to/model.gguf
 ```
 
-### Export Index to JSON
+### Export Index
+
+Export the index for sharing. Default format is Parquet (optimized for HuggingFace datasets):
 
 ```bash
-# Export to stdout
-gguf-index export
+# Export to parquet (default)
+gguf-index export -o index.parquet
 
-# Export to a file
-gguf-index export -o my_index.json
+# Export and push to HuggingFace Hub
+gguf-index export -o index.parquet --push --repo myuser/my-gguf-index
+
+# Export to JSONL
+gguf-index export -o index.jsonl -f jsonl
+
+# Export to JSON (to stdout)
+gguf-index export -f json
+```
+
+### Import Index
+
+Import an index from a file or HuggingFace dataset:
+
+```bash
+# Import from HuggingFace (default: mozilla-ai/gguf-index)
+gguf-index import
+
+# Import from a specific HuggingFace dataset
+gguf-index import --repo myuser/my-gguf-index
+
+# Import from a local parquet file
+gguf-index import index.parquet
+
+# Import from JSONL file
+gguf-index import index.jsonl
+
+# Merge with existing data (default: replace)
+gguf-index import --merge
 ```
 
 ### View Index Statistics
@@ -92,8 +129,13 @@ index.load()
 # Build index from HuggingFace search
 files_indexed = index.build_from_search(query="llama", limit=10)
 
-# Index a specific repository
-index.index_repo("TheBloke/Llama-2-7B-GGUF")
+# Index a specific repository (returns files_indexed, skipped_commit)
+files_indexed, skipped = index.index_repo("TheBloke/Llama-2-7B-GGUF")
+if skipped:
+    print(f"Skipped (already indexed at {skipped[:12]})")
+
+# Force re-indexing
+files_indexed, _ = index.index_repo("TheBloke/Llama-2-7B-GGUF", force=True)
 
 # Look up a file by SHA256 (returns list of all known sources)
 entries = index.lookup("abc123def456...")
@@ -143,10 +185,20 @@ When looking up a file by SHA256, all matching URLs (across repos and historical
 
 GGUF Index supports two storage backends:
 
-- **JSON**: Portable and shareable, stored in `~/.gguf-index/index.json`
-- **SQLite**: Fast lookups with indexed SHA256 column, stored in `~/.gguf-index/index.db`
+- **SQLite** (default): Fast indexed lookups, stored in `~/.gguf-index/index.db`
+- **JSON** (opt-in): Portable format, stored in `~/.gguf-index/index.json`
 
-By default, both backends are used. You can customize the storage paths or disable either backend via CLI options.
+By default, only SQLite is used. Use `--json` to also write to JSON, or use `gguf-index export` to share via parquet.
+
+## Caching
+
+GGUF Index caches which repositories have been indexed, including their HEAD commit and how many revisions were indexed. This allows:
+
+- **Skip unchanged repos**: Re-running `search` or `add` skips repos that haven't changed
+- **Incremental updates**: Only new or updated repos are re-indexed
+- **Force re-indexing**: Use `--force` to bypass the cache
+
+The cache is stored in the SQLite backend's `repos` table.
 
 ## License
 

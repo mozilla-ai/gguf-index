@@ -11,6 +11,7 @@ from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskPr
 from rich.table import Table
 
 from .index import GGUFIndex, DEFAULT_JSON_PATH, DEFAULT_SQLITE_PATH
+from .storage import SchemaMigrationNeeded, SQLiteStorage
 
 console = Console()
 
@@ -33,13 +34,33 @@ def get_index(
     verbose: bool = False,
 ) -> GGUFIndex:
     """Create a GGUFIndex with the specified storage backends."""
+    # JSON is opt-in (only if --json flag or --json-path provided)
     json_p = Path(json_path) if json_path else (DEFAULT_JSON_PATH if use_json else None)
+    # SQLite is the default
     sqlite_p = Path(sqlite_path) if sqlite_path else (DEFAULT_SQLITE_PATH if use_sqlite else None)
 
-    # Default to both if neither specified
+    # Default to SQLite-only if neither specified
     if not json_p and not sqlite_p:
-        json_p = DEFAULT_JSON_PATH
         sqlite_p = DEFAULT_SQLITE_PATH
+
+    # Check for schema migration before creating index
+    if sqlite_p:
+        storage = SQLiteStorage(sqlite_p)
+        current_version, needs_migration = storage.check_schema_version()
+        if needs_migration and current_version is not None:
+            console.print(
+                f"[yellow]Database schema migration needed: v{current_version} -> v{SQLiteStorage.SCHEMA_VERSION}[/yellow]"
+            )
+            console.print(f"[dim]Database: {sqlite_p}[/dim]")
+            console.print(
+                "\nThe existing database will be backed up and a new one created."
+            )
+            if not click.confirm("Proceed with migration?", default=True):
+                console.print("[red]Aborted.[/red]")
+                sys.exit(1)
+
+            backup_path = storage.backup_and_recreate()
+            console.print(f"[green]Backed up old database to: {backup_path}[/green]")
 
     # Get token from argument or environment
     token = get_hf_token(hf_token)
@@ -62,13 +83,14 @@ def cli():
 @click.option("--revisions", "-r", type=int, default=1, help="Max revisions per file (default: 1, use 0 for all)")
 @click.option("--rate", type=float, default=None, help="Requests per second (default: 1.5 anon, 3 auth; 0 = unlimited)")
 @click.option("--workers", "-w", type=int, default=4, help="Number of parallel workers (default: 4)")
+@click.option("--force", "-f", is_flag=True, help="Force re-indexing even if cached")
 @click.option("--verbose", "-v", is_flag=True, help="Enable verbose logging")
 @click.option("--token", "-t", type=str, default=None, help="HuggingFace API token (or set HF_TOKEN env var)")
 @click.option("--json-path", type=click.Path(), help="Path to JSON index file")
 @click.option("--sqlite-path", type=click.Path(), help="Path to SQLite database file")
-@click.option("--json/--no-json", "use_json", default=True, help="Use JSON storage")
+@click.option("--json/--no-json", "use_json", default=False, help="Also use JSON storage (opt-in)")
 @click.option("--sqlite/--no-sqlite", "use_sqlite", default=True, help="Use SQLite storage")
-def search(query: str | None, limit: int | None, revisions: int, rate: float | None, workers: int, verbose: bool, token: str | None, json_path: str | None, sqlite_path: str | None, use_json: bool, use_sqlite: bool):
+def search(query: str | None, limit: int | None, revisions: int, rate: float | None, workers: int, force: bool, verbose: bool, token: str | None, json_path: str | None, sqlite_path: str | None, use_json: bool, use_sqlite: bool):
     """Search HuggingFace for GGUF files and add them to the index.
 
     QUERY is an optional search term to filter repositories.
@@ -77,27 +99,53 @@ def search(query: str | None, limit: int | None, revisions: int, rate: float | N
 
     # Convert 0 to None (no limit)
     max_revisions = revisions if revisions != 0 else None
+    skipped_count = 0
+    checked_count = 0
 
     with Progress(
         SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
         BarColumn(),
         TaskProgressColumn(),
+        TextColumn("{task.fields[status]}"),
+        TextColumn("[progress.description]{task.description}"),
         console=console,
     ) as progress:
-        task = progress.add_task("Searching repositories...", total=None)
+        task = progress.add_task("Searching repositories...", total=None, status="")
+
+        def make_status():
+            indexed = checked_count - skipped_count
+            return f"[green]repos: {indexed}[/green] [yellow]cached: {skipped_count}[/yellow]"
 
         def update_progress(repo_id: str, current: int, total: int):
-            progress.update(task, description=f"Indexing {repo_id}", completed=current, total=total)
+            nonlocal checked_count
+            checked_count = current
+            progress.update(task, description=f"Checking {repo_id}", completed=current, total=total, status=make_status())
+
+        def on_skip(repo_id: str, commit: str):
+            nonlocal skipped_count
+            skipped_count += 1
+            progress.update(task, description=f"[dim]Cached: {repo_id}[/dim]", status=make_status())
+            if verbose:
+                console.print(f"[dim]Skipping {repo_id} (at {commit[:8]})[/dim]")
+
+        def on_index(repo_id: str, file_count: int):
+            progress.update(task, description=f"[green]Indexed: {repo_id}[/green]", status=make_status())
 
         files_indexed = index.build_from_search(
             query=query,
             limit=limit,
             max_revisions=max_revisions,
             progress_callback=update_progress,
+            force=force,
+            skip_callback=on_skip,
+            index_callback=on_index,
         )
 
-    console.print(f"\n[green]Indexed {files_indexed} GGUF files[/green]")
+    indexed_repos = checked_count - skipped_count
+    console.print(f"\n[green]Indexed {files_indexed} files from {indexed_repos} repos[/green]")
+    if skipped_count > 0:
+        console.print(f"[yellow]Skipped {skipped_count} cached repos[/yellow] [dim](use --force to re-index)[/dim]")
+    console.print(f"[dim]HTTP requests: {index.api.request_count}[/dim]")
 
 
 @cli.command()
@@ -105,13 +153,14 @@ def search(query: str | None, limit: int | None, revisions: int, rate: float | N
 @click.option("--revisions", "-r", type=int, default=1, help="Max revisions per file (default: 1, use 0 for all)")
 @click.option("--rate", type=float, default=None, help="Requests per second (default: 1.5 anon, 3 auth; 0 = unlimited)")
 @click.option("--workers", "-w", type=int, default=4, help="Number of parallel workers (default: 4)")
+@click.option("--force", "-f", is_flag=True, help="Force re-indexing even if cached")
 @click.option("--verbose", "-v", is_flag=True, help="Enable verbose logging")
 @click.option("--token", "-t", type=str, default=None, help="HuggingFace API token (or set HF_TOKEN env var)")
 @click.option("--json-path", type=click.Path(), help="Path to JSON index file")
 @click.option("--sqlite-path", type=click.Path(), help="Path to SQLite database file")
-@click.option("--json/--no-json", "use_json", default=True, help="Use JSON storage")
+@click.option("--json/--no-json", "use_json", default=False, help="Also use JSON storage (opt-in)")
 @click.option("--sqlite/--no-sqlite", "use_sqlite", default=True, help="Use SQLite storage")
-def add(repo_id: str, revisions: int, rate: float | None, workers: int, verbose: bool, token: str | None, json_path: str | None, sqlite_path: str | None, use_json: bool, use_sqlite: bool):
+def add(repo_id: str, revisions: int, rate: float | None, workers: int, force: bool, verbose: bool, token: str | None, json_path: str | None, sqlite_path: str | None, use_json: bool, use_sqlite: bool):
     """Index all GGUF files from a specific repository.
 
     REPO_ID is the HuggingFace repository ID (e.g., TheBloke/Llama-2-7B-GGUF).
@@ -123,8 +172,13 @@ def add(repo_id: str, revisions: int, rate: float | None, workers: int, verbose:
 
     with console.status(f"Indexing {repo_id}..."):
         try:
-            files_indexed = index.index_repo(repo_id, max_revisions=max_revisions)
-            console.print(f"[green]Indexed {files_indexed} GGUF files from {repo_id}[/green]")
+            files_indexed, skipped_commit = index.index_repo(repo_id, max_revisions=max_revisions, force=force)
+            if skipped_commit:
+                console.print(f"[yellow]Skipping {repo_id} (already indexed at commit {skipped_commit[:12]})[/yellow]")
+                console.print("[dim]Use --force to re-index[/dim]")
+            else:
+                console.print(f"[green]Indexed {files_indexed} GGUF files from {repo_id}[/green]")
+            console.print(f"[dim]HTTP requests: {index.api.request_count}[/dim]")
         except Exception as e:
             console.print(f"[red]Error: {e}[/red]")
             sys.exit(1)
@@ -134,7 +188,7 @@ def add(repo_id: str, revisions: int, rate: float | None, workers: int, verbose:
 @click.argument("hashes", nargs=-1, required=True)
 @click.option("--json-path", type=click.Path(), help="Path to JSON index file")
 @click.option("--sqlite-path", type=click.Path(), help="Path to SQLite database file")
-@click.option("--json/--no-json", "use_json", default=True, help="Use JSON storage")
+@click.option("--json/--no-json", "use_json", default=False, help="Also use JSON storage (opt-in)")
 @click.option("--sqlite/--no-sqlite", "use_sqlite", default=True, help="Use SQLite storage")
 def lookup(hashes: tuple[str, ...], json_path: str | None, sqlite_path: str | None, use_json: bool, use_sqlite: bool):
     """Look up GGUF file(s) by SHA256 hash.
@@ -182,7 +236,7 @@ def lookup(hashes: tuple[str, ...], json_path: str | None, sqlite_path: str | No
 @click.argument("file_paths", nargs=-1, required=True, type=click.Path(exists=True))
 @click.option("--json-path", type=click.Path(), help="Path to JSON index file")
 @click.option("--sqlite-path", type=click.Path(), help="Path to SQLite database file")
-@click.option("--json/--no-json", "use_json", default=True, help="Use JSON storage")
+@click.option("--json/--no-json", "use_json", default=False, help="Also use JSON storage (opt-in)")
 @click.option("--sqlite/--no-sqlite", "use_sqlite", default=True, help="Use SQLite storage")
 def identify(file_paths: tuple[str, ...], json_path: str | None, sqlite_path: str | None, use_json: bool, use_sqlite: bool):
     """Identify local GGUF file(s) by computing SHA256 and looking up.
@@ -241,22 +295,88 @@ def identify(file_paths: tuple[str, ...], json_path: str | None, sqlite_path: st
 
 
 @cli.command(name="export")
-@click.option("--output", "-o", type=click.Path(), help="Output file path (default: stdout)")
-@click.option("--format", "-f", "fmt", type=click.Choice(["json", "jsonl"]), default="jsonl", help="Output format (default: jsonl)")
+@click.option("--output", "-o", type=click.Path(), help="Output file path (default: stdout for json/jsonl, required for parquet)")
+@click.option("--format", "-f", "fmt", type=click.Choice(["parquet", "json", "jsonl"]), default="parquet", help="Output format (default: parquet)")
+@click.option("--push", is_flag=True, help="Push to HuggingFace dataset repo after export")
+@click.option("--repo", default="mozilla-ai/gguf-index", help="HuggingFace dataset repo for push")
+@click.option("--message", "-m", type=str, default=None, help="Commit message for push (default: 'Update gguf-index')")
+@click.option("--token", "-t", type=str, default=None, help="HuggingFace API token for push (or set HF_TOKEN env var)")
 @click.option("--json-path", type=click.Path(), help="Path to JSON index file")
 @click.option("--sqlite-path", type=click.Path(), help="Path to SQLite database file")
-@click.option("--json/--no-json", "use_json", default=True, help="Use JSON storage")
+@click.option("--json/--no-json", "use_json", default=False, help="Also use JSON storage (opt-in)")
 @click.option("--sqlite/--no-sqlite", "use_sqlite", default=True, help="Use SQLite storage")
-def export_cmd(output: str | None, fmt: str, json_path: str | None, sqlite_path: str | None, use_json: bool, use_sqlite: bool):
+def export_cmd(output: str | None, fmt: str, push: bool, repo: str, message: str | None, token: str | None, json_path: str | None, sqlite_path: str | None, use_json: bool, use_sqlite: bool):
     """Export the index for sharing.
 
-    Default format is JSONL (one entry per line), which is efficient for sharing and importing.
+    Default format is Parquet, optimized for HuggingFace datasets with Xet storage.
+    Use --push to upload directly to a HuggingFace dataset repository.
     """
+    from .parquet import export_from_sqlite_streaming, export_to_parquet, push_to_hf
+
     index = get_index(json_path, sqlite_path, use_json, use_sqlite)
 
-    entries = index.get_all()
+    if fmt == "parquet":
+        if not output and not push:
+            console.print("[red]Error: --output is required for parquet format (or use --push)[/red]")
+            sys.exit(1)
 
-    if fmt == "jsonl":
+        output_path = Path(output) if output else Path("gguf_index.parquet")
+
+        # Use streaming export for SQLite (memory efficient)
+        if index.sqlite_storage:
+            repos = index.sqlite_storage.get_all_repo_cache()
+
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                BarColumn(),
+                TaskProgressColumn(),
+                console=console,
+            ) as progress:
+                task = None
+
+                def update_progress(count: int, total: int) -> None:
+                    nonlocal task
+                    if task is None:
+                        task = progress.add_task("Exporting...", total=total)
+                    progress.update(task, completed=count)
+
+                conn = index.sqlite_storage._get_conn()
+                exported = export_from_sqlite_streaming(
+                    conn, output_path, progress_callback=update_progress
+                )
+
+            # Export repos cache
+            repos_path = None
+            if repos:
+                import pandas as pd
+                from .parquet import _get_repos_path
+                repos_path = _get_repos_path(output_path)
+                repos_df = pd.DataFrame(repos)
+                repos_df.to_parquet(repos_path, index=False, engine="pyarrow")
+
+            console.print(f"[green]Exported {exported:,} entries to {output_path}[/green]")
+            if repos_path and repos:
+                console.print(f"[green]Exported {len(repos):,} cached repos to {repos_path}[/green]")
+        else:
+            # Fallback for non-SQLite backends
+            entries = index.get_all()
+            with console.status(f"Exporting {len(entries)} entries to parquet..."):
+                repos_path = export_to_parquet(entries, output_path, repos=None)
+            console.print(f"[green]Exported {len(entries)} entries to {output_path}[/green]")
+
+        if push:
+            hf_token = get_hf_token(token)
+            if not hf_token:
+                console.print("[red]Error: HF_TOKEN required for push (set env var or use --token)[/red]")
+                sys.exit(1)
+
+            console.print(f"Pushing to {repo}...")
+            url = push_to_hf(output_path, repo, token=hf_token, commit_message=message or "Update gguf-index")
+            console.print(f"[green]Pushed to {url}[/green]")
+
+    elif fmt == "jsonl":
+        entries = index.get_all()
         lines = [json.dumps(entry.to_dict(), separators=(",", ":")) for entry in entries]
         content = "\n".join(lines)
         if output:
@@ -266,7 +386,9 @@ def export_cmd(output: str | None, fmt: str, json_path: str | None, sqlite_path:
             console.print(f"[green]Exported {len(entries)} entries to {output} (JSONL)[/green]")
         else:
             click.echo(content)
+
     else:  # json
+        entries = index.get_all()
         data = {f"{e.repo_id}/{e.revision}/{e.filename}": e.to_dict() for e in entries}
         if output:
             with open(output, "w") as f:
@@ -277,43 +399,162 @@ def export_cmd(output: str | None, fmt: str, json_path: str | None, sqlite_path:
 
 
 @cli.command(name="import")
-@click.argument("input_file", type=click.Path(exists=True))
+@click.argument("source", required=False)
+@click.option("--repo", default="mozilla-ai/gguf-index", help="HuggingFace dataset repo to download from")
+@click.option("--format", "-f", "fmt", type=click.Choice(["parquet", "jsonl"]), default=None, help="Input format (auto-detected from extension)")
+@click.option("--merge", is_flag=True, help="Merge with existing data (default: prompt if data exists)")
+@click.option("--replace", is_flag=True, help="Replace existing data without prompting")
+@click.option("--token", "-t", type=str, default=None, help="HuggingFace API token (or set HF_TOKEN env var)")
 @click.option("--json-path", type=click.Path(), help="Path to JSON index file")
 @click.option("--sqlite-path", type=click.Path(), help="Path to SQLite database file")
-@click.option("--json/--no-json", "use_json", default=True, help="Use JSON storage")
+@click.option("--json/--no-json", "use_json", default=False, help="Also use JSON storage (opt-in)")
 @click.option("--sqlite/--no-sqlite", "use_sqlite", default=True, help="Use SQLite storage")
-def import_cmd(input_file: str, json_path: str | None, sqlite_path: str | None, use_json: bool, use_sqlite: bool):
-    """Import entries from a JSONL file into the local index.
+def import_cmd(source: str | None, repo: str, fmt: str | None, merge: bool, replace: bool, token: str | None, json_path: str | None, sqlite_path: str | None, use_json: bool, use_sqlite: bool):
+    """Import index from parquet file or HuggingFace dataset.
 
-    INPUT_FILE is a JSONL file (one JSON entry per line).
+    SOURCE is a local file path. If not provided, downloads from --repo.
+    Format is auto-detected from extension (.parquet or .jsonl).
     """
+    from .parquet import download_from_hf, import_from_parquet, import_repos_from_parquet
     from .storage import GGUFEntry
 
     index = get_index(json_path, sqlite_path, use_json, use_sqlite)
+    hf_token = get_hf_token(token)
+
+    # Check for existing data and prompt user if needed
+    existing_count = index.count()
+    do_merge = merge
+    do_backup = False
+
+    if existing_count > 0 and not merge and not replace:
+        # Existing data found, prompt user
+        console.print(f"[yellow]Existing index found with {existing_count:,} entries[/yellow]")
+        if index.sqlite_storage:
+            console.print(f"[dim]Database: {index.sqlite_storage.path}[/dim]")
+
+        console.print("\nHow would you like to proceed?")
+        console.print("  [cyan]1[/cyan] - Backup existing index and replace with imported data")
+        console.print("  [cyan]2[/cyan] - Replace without backup (overwrite)")
+        console.print("  [cyan]3[/cyan] - Merge imported data into existing index")
+        console.print("  [cyan]4[/cyan] - Abort")
+
+        choice = click.prompt("Choose an option", type=click.Choice(["1", "2", "3", "4"]), default="1")
+
+        if choice == "1":
+            do_backup = True
+        elif choice == "2":
+            pass  # Just replace
+        elif choice == "3":
+            do_merge = True
+        else:
+            console.print("[red]Aborted.[/red]")
+            sys.exit(1)
+
+    # Determine source
+    repos_path = None
+    if source is None:
+        # Download from HuggingFace
+        with console.status(f"Downloading from {repo}..."):
+            source_path, repos_path = download_from_hf(repo, token=hf_token)
+        console.print(f"[dim]Downloaded from {repo}[/dim]")
+        detected_fmt = "parquet"
+    else:
+        source_path = Path(source)
+        if not source_path.exists():
+            console.print(f"[red]Error: File not found: {source}[/red]")
+            sys.exit(1)
+        # Auto-detect format
+        if fmt:
+            detected_fmt = fmt
+        elif source_path.suffix == ".parquet":
+            detected_fmt = "parquet"
+        else:
+            detected_fmt = "jsonl"
+
+    # Handle backup if requested
+    if do_backup and index.sqlite_storage:
+        backup_path = index.sqlite_storage.backup_and_recreate()
+        console.print(f"[green]Backed up old database to: {backup_path}[/green]")
+        # Reload the index with fresh database
+        index = get_index(json_path, sqlite_path, use_json, use_sqlite)
+
+    # Clear existing data if not merging
+    if not do_merge:
+        if index.sqlite_storage:
+            index.sqlite_storage.clear_all()
+        console.print("[dim]Replacing existing index data[/dim]")
 
     imported = 0
     errors = 0
 
-    with open(input_file, "r") as f:
-        with console.status("Importing entries...") as status:
-            for line_num, line in enumerate(f, 1):
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    data = json.loads(line)
-                    entry = GGUFEntry.from_dict(data)
-                    index.add(entry)
-                    imported += 1
-                    if imported % 10000 == 0:
-                        status.update(f"Imported {imported} entries...")
-                except Exception as e:
-                    errors += 1
-                    if errors <= 5:
-                        console.print(f"[yellow]Line {line_num}: {e}[/yellow]")
+    if detected_fmt == "parquet":
+        # Use optimized streaming bulk import for SQLite
+        if index.sqlite_storage:
+            from .parquet import iter_parquet_batches
+
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                BarColumn(),
+                TaskProgressColumn(),
+                console=console,
+            ) as progress:
+                task = None
+
+                def update_progress(count: int, total: int) -> None:
+                    nonlocal task
+                    if task is None:
+                        task = progress.add_task("Importing...", total=total)
+                    progress.update(task, completed=count)
+
+                imported = index.sqlite_storage.bulk_import_batches(
+                    iter_parquet_batches(source_path),
+                    progress_callback=update_progress,
+                )
+        else:
+            # Fallback for non-SQLite backends
+            with console.status("Importing from parquet...") as status:
+                for entry in import_from_parquet(source_path):
+                    try:
+                        index.add(entry)
+                        imported += 1
+                        if imported % 10000 == 0:
+                            status.update(f"Imported {imported} entries...")
+                    except Exception as e:
+                        errors += 1
+                        if errors <= 5:
+                            console.print(f"[yellow]Error: {e}[/yellow]")
+
+        # Import repos cache if available
+        repos_imported = 0
+        if index.sqlite_storage:
+            repos = import_repos_from_parquet(repos_path if repos_path else source_path)
+            if repos:
+                repos_imported = index.sqlite_storage.import_repo_cache(repos)
+    else:  # jsonl
+        repos_imported = 0  # JSONL doesn't support repos cache
+        with open(source_path, "r") as f:
+            with console.status("Importing from JSONL...") as status:
+                for line_num, line in enumerate(f, 1):
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        data = json.loads(line)
+                        entry = GGUFEntry.from_dict(data)
+                        index.add(entry)
+                        imported += 1
+                        if imported % 10000 == 0:
+                            status.update(f"Imported {imported} entries...")
+                    except Exception as e:
+                        errors += 1
+                        if errors <= 5:
+                            console.print(f"[yellow]Line {line_num}: {e}[/yellow]")
 
     index.save()
     console.print(f"[green]Imported {imported} entries[/green]")
+    if repos_imported:
+        console.print(f"[green]Imported {repos_imported} cached repos[/green]")
     if errors:
         console.print(f"[yellow]Skipped {errors} invalid entries[/yellow]")
 
@@ -321,7 +562,7 @@ def import_cmd(input_file: str, json_path: str | None, sqlite_path: str | None, 
 @cli.command()
 @click.option("--json-path", type=click.Path(), help="Path to JSON index file")
 @click.option("--sqlite-path", type=click.Path(), help="Path to SQLite database file")
-@click.option("--json/--no-json", "use_json", default=True, help="Use JSON storage")
+@click.option("--json/--no-json", "use_json", default=False, help="Also use JSON storage (opt-in)")
 @click.option("--sqlite/--no-sqlite", "use_sqlite", default=True, help="Use SQLite storage")
 def stats(json_path: str | None, sqlite_path: str | None, use_json: bool, use_sqlite: bool):
     """Show index statistics."""
@@ -341,6 +582,8 @@ def stats(json_path: str | None, sqlite_path: str | None, use_json: bool, use_sq
     table.add_row("Total Sources", str(statistics["total_sources"]))
     table.add_row("Total Size", _format_size(statistics["total_size"]))
     table.add_row("Unique Repos", str(statistics["unique_repos"]))
+    if "cached_repos" in statistics:
+        table.add_row("Cached Repos", str(statistics["cached_repos"]))
 
     console.print(table)
 
