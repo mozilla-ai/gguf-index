@@ -460,3 +460,37 @@ class SQLiteStorage(StorageBackend):
             count += 1
         conn.commit()
         return count
+
+    def get_stats(self) -> dict[str, Any]:
+        """Get index statistics using efficient SQL aggregation."""
+        conn = self._get_conn()
+
+        # Basic counts
+        total = conn.execute("SELECT COUNT(*) FROM gguf_files").fetchone()[0]
+        unique_files = conn.execute("SELECT COUNT(DISTINCT sha256) FROM gguf_files").fetchone()[0]
+        unique_repos = conn.execute("SELECT COUNT(DISTINCT repo_id) FROM gguf_files").fetchone()[0]
+        cached_repos = conn.execute("SELECT COUNT(*) FROM repos").fetchone()[0]
+
+        # Total size (sum of sizes for unique hashes only)
+        total_size = conn.execute("""
+            SELECT COALESCE(SUM(size), 0) FROM (
+                SELECT size FROM gguf_files GROUP BY sha256
+            )
+        """).fetchone()[0]
+
+        # Per-repo counts (sorted by count descending)
+        repo_counts = conn.execute("""
+            SELECT repo_id, COUNT(*) as count
+            FROM gguf_files
+            GROUP BY repo_id
+            ORDER BY count DESC
+        """).fetchall()
+
+        return {
+            "total_sources": total,
+            "unique_files": unique_files,
+            "total_size": total_size,
+            "unique_repos": unique_repos,
+            "cached_repos": cached_repos,
+            "repos": [(row[0], row[1]) for row in repo_counts],
+        }

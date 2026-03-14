@@ -488,6 +488,8 @@ def stats(json_path: str | None, sqlite_path: str | None, use_json: bool, use_sq
     table.add_row("Total Sources", str(statistics["total_sources"]))
     table.add_row("Total Size", _format_size(statistics["total_size"]))
     table.add_row("Unique Repos", str(statistics["unique_repos"]))
+    if "cached_repos" in statistics:
+        table.add_row("Cached Repos", str(statistics["cached_repos"]))
 
     console.print(table)
 

@@ -355,6 +355,11 @@ class GGUFIndex:
 
     def stats(self) -> dict:
         """Get statistics about the index."""
+        # Use SQL-based stats for SQLite backend (much faster for large datasets)
+        if self.sqlite_storage:
+            return self.sqlite_storage.get_stats()
+
+        # Fallback to Python-based stats for JSON backend
         entries = self.get_all()
         unique_hashes = self.count_unique_hashes()
 
