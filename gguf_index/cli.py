@@ -112,22 +112,24 @@ def search(query: str | None, limit: int | None, revisions: int, rate: float | N
     ) as progress:
         task = progress.add_task("Searching repositories...", total=None, status="")
 
+        def make_status():
+            indexed = checked_count - skipped_count
+            return f"[green]repos: {indexed}[/green] [yellow]cached: {skipped_count}[/yellow]"
+
         def update_progress(repo_id: str, current: int, total: int):
             nonlocal checked_count
             checked_count = current
-            # Use (current - 1) because we haven't finished checking this repo yet
-            indexed = (current - 1) - skipped_count
-            status = f"[green]indexed: {indexed}[/green] [yellow]cached: {skipped_count}[/yellow]"
-            progress.update(task, description=f"Checking {repo_id}", completed=current, total=total, status=status)
+            progress.update(task, description=f"Checking {repo_id}", completed=current, total=total, status=make_status())
 
         def on_skip(repo_id: str, commit: str):
             nonlocal skipped_count
             skipped_count += 1
-            indexed = checked_count - skipped_count
-            status = f"[green]indexed: {indexed}[/green] [yellow]cached: {skipped_count}[/yellow]"
-            progress.update(task, description=f"[dim]Cached: {repo_id}[/dim]", status=status)
+            progress.update(task, description=f"[dim]Cached: {repo_id}[/dim]", status=make_status())
             if verbose:
                 console.print(f"[dim]Skipping {repo_id} (at {commit[:8]})[/dim]")
+
+        def on_index(repo_id: str, file_count: int):
+            progress.update(task, description=f"[green]Indexed: {repo_id}[/green]", status=make_status())
 
         files_indexed = index.build_from_search(
             query=query,
@@ -136,6 +138,7 @@ def search(query: str | None, limit: int | None, revisions: int, rate: float | N
             progress_callback=update_progress,
             force=force,
             skip_callback=on_skip,
+            index_callback=on_index,
         )
 
     indexed_repos = checked_count - skipped_count

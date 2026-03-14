@@ -180,6 +180,7 @@ class GGUFIndex:
         progress_callback: Callable[[str, int, int], None] | None = None,
         force: bool = False,
         skip_callback: Callable[[str, str], None] | None = None,
+        index_callback: Callable[[str, int], None] | None = None,
     ) -> int:
         """
         Build the index by searching HuggingFace for GGUF repositories.
@@ -191,6 +192,7 @@ class GGUFIndex:
             progress_callback: Optional callback(repo_id, current, total) for progress
             force: Force re-indexing even if cached
             skip_callback: Optional callback(repo_id, commit) when skipping a cached repo
+            index_callback: Optional callback(repo_id, file_count) after indexing a repo
 
         Returns:
             Number of files indexed
@@ -229,6 +231,9 @@ class GGUFIndex:
 
                 # Update cache after successful indexing (even if no files found)
                 self._set_repo_cache(repo_id, current_commit, max_revisions)
+
+                if index_callback:
+                    index_callback(repo_id, repo_files)
             except Exception:
                 # Skip repos that fail (access issues, etc.)
                 continue
