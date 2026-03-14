@@ -4,7 +4,7 @@ from pathlib import Path
 from typing import Any, Iterator
 
 import pandas as pd
-from huggingface_hub import HfApi, hf_hub_download
+from huggingface_hub import CommitOperationAdd, HfApi, hf_hub_download
 
 from .storage import GGUFEntry
 
@@ -161,7 +161,7 @@ def push_to_hf(
 ) -> str:
     """Push parquet files to HF dataset repo.
 
-    Uploads both the data file and repos cache file (if exists).
+    Uploads both the data file and repos cache file (if exists) in a single commit.
 
     Args:
         path: Path to the local parquet file
@@ -178,25 +178,25 @@ def push_to_hf(
     # Create repo if it doesn't exist
     api.create_repo(repo_id=repo, repo_type="dataset", exist_ok=True)
 
-    # Upload the data file
-    api.upload_file(
-        path_or_fileobj=str(path),
-        path_in_repo=filename,
-        repo_id=repo,
-        repo_type="dataset",
-        commit_message=commit_message,
-    )
+    # Build list of operations for a single commit
+    operations = [
+        CommitOperationAdd(path_in_repo=filename, path_or_fileobj=str(path)),
+    ]
 
-    # Upload repos cache file if it exists
+    # Add repos cache file if it exists
     repos_path = _get_repos_path(path)
     if repos_path.exists():
         repos_filename = filename.replace(".parquet", ".repos.parquet")
-        api.upload_file(
-            path_or_fileobj=str(repos_path),
-            path_in_repo=repos_filename,
-            repo_id=repo,
-            repo_type="dataset",
-            commit_message=f"{commit_message} (repos cache)",
+        operations.append(
+            CommitOperationAdd(path_in_repo=repos_filename, path_or_fileobj=str(repos_path))
         )
+
+    # Upload all files in a single commit
+    api.create_commit(
+        repo_id=repo,
+        repo_type="dataset",
+        operations=operations,
+        commit_message=commit_message,
+    )
 
     return f"https://huggingface.co/datasets/{repo}/blob/main/{filename}"

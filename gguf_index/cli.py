@@ -340,9 +340,8 @@ def export_cmd(output: str | None, fmt: str, push: bool, repo: str, token: str |
                 console.print("[red]Error: HF_TOKEN required for push (set env var or use --token)[/red]")
                 sys.exit(1)
 
-            with console.status(f"Pushing to {repo}..."):
-                url = push_to_hf(output_path, repo, token=hf_token)
-
+            console.print(f"Pushing to {repo}...")
+            url = push_to_hf(output_path, repo, token=hf_token)
             console.print(f"[green]Pushed to {url}[/green]")
 
     elif fmt == "jsonl":
