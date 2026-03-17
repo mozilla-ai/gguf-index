@@ -66,12 +66,13 @@ def export_from_sqlite_streaming(
     # Ensure parent directory exists
     path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Query for streaming read - ORDER BY primary key for consistent chunk boundaries
-    # This ensures Xet CDC deduplication works properly on incremental updates
+    # Query for streaming read - ORDER BY indexed_at for optimal CDC deduplication
+    # Old entries stay at the beginning (stable chunks), new entries append at the end
+    # This minimizes chunk changes on incremental updates
     query = """
         SELECT sha256, repo_id, revision, filename, size, indexed_at
         FROM gguf_files
-        ORDER BY repo_id, revision, filename
+        ORDER BY indexed_at, repo_id, revision, filename
     """
 
     writer = None
